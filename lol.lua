@@ -11,9 +11,6 @@ local CHECK_INTERVAL   = 1
 local HEARTBEAT_INTERVAL = 10
 local DISCORD_UPDATE_INTERVAL = 300
 
--- Words in Status/TextLabel that mean the fruit is NOT buyable right now
-local OUT_OF_STOCK_WORDS = { "out of stock", "sold", "unavailable", "none", "empty" }
-
 local HttpService = game:GetService("HttpService")
 local LocalPlayer = game.Players.LocalPlayer
 
@@ -23,14 +20,15 @@ local Cache = {
     updateCounter = 0,
     lastHeartbeat = 0,
     lastDiscordUpdate = 0,
-    fruits = {}
+    fruits = {},
+    restock = ""
 }
 
 -- UI element patterns to ignore
 local IGNORE_PATTERNS = {
     "_padding", "padding", "uilistlayout", "uigridlayout", "uipadding",
     "uicorner", "uistroke", "uigradient", "uiaspectratioconstraint",
-    "u: ", "shadow", "bevel", "template", "example"
+    "u: ", "shadow", "bevel", "template", "example", "search"
 }
 
 local function shouldIgnoreItem(itemName)
@@ -43,6 +41,30 @@ end
 
 local function trim(s)
     return (tostring(s or ""):gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+-- STRIP ROBLOX RICH TEXT: <font size='15'>$</font>1,700,000 -> $1,700,000
+-- This is the fix: without it, the "15" inside size='15' gets read as the stock.
+local function stripRichText(s)
+    s = tostring(s or "")
+    s = s:gsub("<[^<>]*>", "")            -- kill every tag
+    s = s:gsub("&quot;", '"'):gsub("&apos;", "'")
+    s = s:gsub("&lt;", "<"):gsub("&gt;", ">"):gsub("&amp;", "&")
+    return trim(s)
+end
+
+-- Grab a named TextLabel/TextButton's text from an item entry (RAW, tags intact)
+local function readText(entry, childName)
+    local direct = entry:FindFirstChild(childName)
+    if direct and (direct:IsA("TextLabel") or direct:IsA("TextButton")) then
+        return trim(direct.Text)
+    end
+    for _, d in ipairs(entry:GetDescendants()) do
+        if d.Name == childName and (d:IsA("TextLabel") or d:IsA("TextButton")) then
+            return trim(d.Text)
+        end
+    end
+    return ""
 end
 
 -- Discord notification
@@ -87,13 +109,16 @@ local function autoDeleteOnCrash()
     end)
 end
 
+local function getMainGui()
+    return LocalPlayer:FindFirstChild("PlayerGui")
+        and LocalPlayer.PlayerGui:FindFirstChild("MainGui")
+end
+
 -- Locate the black market ScrollingFrame, wherever MainGui hides it.
 local function findFruitContainer()
-    local mainGui = LocalPlayer:FindFirstChild("PlayerGui")
-        and LocalPlayer.PlayerGui:FindFirstChild("MainGui")
+    local mainGui = getMainGui()
     if not mainGui then return nil end
 
-    -- 1) find FruitFrame anywhere under MainGui
     local fruitFrame = mainGui:FindFirstChild("FruitFrame", true)
     if fruitFrame then
         local scroll = fruitFrame:FindFirstChildWhichIsA("ScrollingFrame")
@@ -104,7 +129,6 @@ local function findFruitContainer()
         return fruitFrame
     end
 
-    -- 2) fallback: any ScrollingFrame under a black-market-ish parent
     for _, d in ipairs(mainGui:GetDescendants()) do
         if d:IsA("ScrollingFrame") then
             local pname = string.lower(d.Parent and d.Parent.Name or "")
@@ -116,46 +140,56 @@ local function findFruitContainer()
     return nil
 end
 
--- Grab a named TextLabel/TextButton's text from an item entry
-local function readText(entry, childName)
-    local direct = entry:FindFirstChild(childName)
-    if direct and (direct:IsA("TextLabel") or direct:IsA("TextButton")) then
-        return trim(direct.Text)
-    end
-    for _, d in ipairs(entry:GetDescendants()) do
-        if d.Name == childName and (d:IsA("TextLabel") or d:IsA("TextButton")) then
-            return trim(d.Text)
+-- RESTOCK TIMER: "Time Until Restock: 03:16:04"
+local function getRestockTimer()
+    local timerText, seconds = "", 0
+    pcall(function()
+        local mainGui = getMainGui()
+        if not mainGui then return end
+        for _, d in ipairs(mainGui:GetDescendants()) do
+            if d:IsA("TextLabel") or d:IsA("TextButton") then
+                local clean = stripRichText(d.Text)
+                if string.lower(clean):match("restock") then
+                    local h, m, s = clean:match("(%d+):(%d+):(%d+)")
+                    if h then
+                        timerText = h .. ":" .. m .. ":" .. s
+                        seconds = tonumber(h) * 3600 + tonumber(m) * 60 + tonumber(s)
+                        return
+                    end
+                    local m2, s2 = clean:match("(%d+):(%d+)")
+                    if m2 then
+                        timerText = m2 .. ":" .. s2
+                        seconds = tonumber(m2) * 60 + tonumber(s2)
+                        return
+                    end
+                end
+            end
         end
-    end
-    return ""
+    end)
+    return timerText, seconds
 end
 
--- Decide stock / availability from the Status text
-local function parseStatus(statusText, entry)
-    local lower = string.lower(statusText)
+-- STATUS PARSER
+-- King Legacy has no quantities. Status is either a price ($1,700,000) or "Out of Stock".
+-- So: inStock = a price is present. price = the number. stock = 1/0 for API compatibility.
+local function parseStatus(rawStatus)
+    local clean = stripRichText(rawStatus)
+    local lower = string.lower(clean)
 
-    for _, word in ipairs(OUT_OF_STOCK_WORDS) do
-        if lower:find(word, 1, true) then
-            return 0, false
-        end
+    if lower:match("out%s*of%s*stock") or lower:match("sold")
+        or lower:match("unavailable") or lower == "" then
+        return clean, false, 0
     end
 
-    -- "x3", "3x", "Stock: 3", "3 Left"
-    local num = statusText:match("[xX]%s*(%d+)")
-        or statusText:match("(%d+)%s*[xX]")
-        or statusText:match("(%d+)")
+    -- strip $ and commas, then read the number: "$1,700,000" -> 1700000
+    local digits = clean:gsub("[^%d]", "")
+    local price = tonumber(digits)
 
-    if num then
-        local n = tonumber(num)
-        return n, n > 0
+    if price and price > 0 then
+        return clean, true, price
     end
 
-    -- No number, no out-of-stock word -> treat visible entry as in stock
-    if statusText ~= "" then return 1, true end
-
-    -- No Status text at all: fall back to whether the entry is visible
-    local vis = (entry:IsA("GuiObject") and entry.Visible) and 1 or 0
-    return vis, vis == 1
+    return clean, false, 0
 end
 
 -- SINGLE-PASS scrape of the black market list
@@ -167,18 +201,19 @@ local function collectBlackMarket()
 
         for _, entry in ipairs(container:GetChildren()) do
             if entry:IsA("GuiObject") and not shouldIgnoreItem(entry.Name) then
-                local statusText  = readText(entry, "Status")
-                local displayName = readText(entry, "TextLabel")
-                local tierText    = readText(entry, "Tier")
-                local stock, inStock = parseStatus(statusText, entry)
+                local rawStatus  = readText(entry, "Status")
+                local statusText, inStock, price = parseStatus(rawStatus)
+                local displayName = stripRichText(readText(entry, "TextLabel"))
+                local tierText    = stripRichText(readText(entry, "Tier"))
 
                 result[entry.Name] = {
-                    name     = (displayName ~= "" and displayName or entry.Name),
-                    stock    = stock,
-                    inStock  = inStock,
-                    status   = statusText,
-                    tier     = tierText,
-                    visible  = entry.Visible
+                    name    = (displayName ~= "" and displayName or entry.Name),
+                    tier    = tierText,
+                    status  = statusText,      -- "Out of Stock" or "$1,700,000"
+                    price   = price,           -- 0 when out of stock
+                    inStock = inStock,
+                    listed  = entry.Visible,   -- is it shown in this restock's list
+                    stock   = inStock and 1 or 0
                 }
             end
         end
@@ -190,6 +225,7 @@ end
 -- COLLECT ALL DATA
 local function collectAllData()
     local fruits = collectBlackMarket()
+    local restockText, restockSeconds = getRestockTimer()
 
     local data = {
         sessionId    = Cache.sessionId,
@@ -199,16 +235,20 @@ local function collectAllData()
         userId       = LocalPlayer.UserId,
         game         = "kinglegacy",
         shop         = "blackmarket",
+        restock      = {text = restockText, seconds = restockSeconds},
         fruits       = fruits
     }
 
-    local total, stocked = 0, 0
+    local total, stocked, listed = 0, 0, 0
     for _, info in pairs(fruits) do
         total = total + 1
         if info.inStock then stocked = stocked + 1 end
+        if info.listed then listed = listed + 1 end
     end
     print("📊 BLACK MARKET: " .. (total > 0 and (total .. " fruits") or "NONE")
-        .. " | In stock: " .. stocked)
+        .. " | Listed: " .. listed
+        .. " | In stock: " .. stocked
+        .. " | Restock: " .. (restockText ~= "" and restockText or "?"))
 
     return data
 end
@@ -257,8 +297,8 @@ local function hasChanges(oldFruits, newFruits)
     for name, info in pairs(newFruits) do
         local old = oldFruits[name]
         if not old then return true end
-        if old.stock ~= info.stock or old.inStock ~= info.inStock
-            or old.status ~= info.status or old.tier ~= info.tier then
+        if old.inStock ~= info.inStock or old.price ~= info.price
+            or old.listed ~= info.listed or old.tier ~= info.tier then
             return true
         end
     end
@@ -292,7 +332,6 @@ local function startMonitoring()
     setupAntiAFK()
     setupCrashDetection()
 
-    -- wait for the UI to exist before the first scrape
     local waited = 0
     while not findFruitContainer() and waited < 30 do
         wait(1); waited = waited + 1
@@ -303,6 +342,7 @@ local function startMonitoring()
 
     local initialData = collectAllData()
     Cache.fruits = initialData.fruits
+    Cache.restock = initialData.restock.text
     Cache.lastHeartbeat = os.time()
     Cache.lastDiscordUpdate = os.time()
 
@@ -318,7 +358,8 @@ local function startMonitoring()
 
             if sendToAPI(currentData) then
                 Cache.fruits = currentData.fruits
-                if changes then print("🔄 CHANGES DETECTED & SENT") end
+                Cache.restock = currentData.restock.text
+                if changes then print("🔄 STOCK CHANGED & SENT") end
             end
 
             if (now - Cache.lastHeartbeat) >= HEARTBEAT_INTERVAL then

@@ -17,6 +17,12 @@ local DISCORD_UPDATE_INTERVAL = 300
 -- Set true only if you want to hard-require the timer.
 local REQUIRE_TIMER = false
 
+-- FruitFrame is shared by multiple shops and only repopulates when a shop opens.
+-- So we fire the Black Market NPC's prompt ourselves on a timer.
+local AUTO_OPEN_SHOP  = true
+local REOPEN_INTERVAL = 20      -- seconds between re-opens
+local SHOP_KEYWORDS   = {"black market", "blackmarket", "fruit", "dealer", "market"}
+
 local HttpService = game:GetService("HttpService")
 local LocalPlayer = game.Players.LocalPlayer
 
@@ -150,6 +156,71 @@ local function getRestock(fruitFrame)
         end
     end
     return text, seconds, valid
+end
+
+-- ==== SHOP OPENER ====
+-- The fruit list only refreshes when a shop actually opens, so trigger it.
+
+local function matchesShop(text)
+    local l = string.lower(tostring(text or ""))
+    for _, k in ipairs(SHOP_KEYWORDS) do
+        if l:find(k, 1, true) then return true end
+    end
+    return false
+end
+
+local ShopTriggers = nil
+
+local function findShopTriggers()
+    local prompts, clicks = {}, {}
+    pcall(function()
+        for _, d in ipairs(workspace:GetDescendants()) do
+            if d:IsA("ProximityPrompt") then
+                local label = (d.ObjectText or "") .. " " .. (d.ActionText or "")
+                    .. " " .. d.Name .. " " .. (d.Parent and d.Parent.Name or "")
+                    .. " " .. (d.Parent and d.Parent.Parent and d.Parent.Parent.Name or "")
+                if matchesShop(label) then
+                    table.insert(prompts, d)
+                    print("🔎 prompt: " .. d.Name .. " @ "
+                        .. (d.Parent and d.Parent:GetFullName() or "?")
+                        .. " [" .. tostring(d.ObjectText) .. " / " .. tostring(d.ActionText) .. "]")
+                end
+            elseif d:IsA("ClickDetector") then
+                local label = d.Name .. " " .. (d.Parent and d.Parent.Name or "")
+                    .. " " .. (d.Parent and d.Parent.Parent and d.Parent.Parent.Name or "")
+                if matchesShop(label) then
+                    table.insert(clicks, d)
+                    print("🔎 click: " .. (d.Parent and d.Parent:GetFullName() or "?"))
+                end
+            end
+        end
+    end)
+    return {prompts = prompts, clicks = clicks}
+end
+
+local function openShop()
+    if not AUTO_OPEN_SHOP then return false end
+    if not ShopTriggers then ShopTriggers = findShopTriggers() end
+
+    local fired = false
+
+    for _, p in ipairs(ShopTriggers.prompts) do
+        pcall(function()
+            -- local-only property change so distance doesn't block us
+            p.MaxActivationDistance = 1000
+            p.RequiresLineOfSight = false
+            p.HoldDuration = 0
+        end)
+        local ok = pcall(function() fireproximityprompt(p) end)
+        if ok then fired = true end
+    end
+
+    for _, c in ipairs(ShopTriggers.clicks) do
+        local ok = pcall(function() fireclickdetector(c) end)
+        if ok then fired = true end
+    end
+
+    return fired
 end
 
 local function parseStatus(statusLabel)
@@ -320,6 +391,17 @@ local function startMonitoring()
         wait(1); waited = waited + 1
     end
 
+    -- Trigger the shop so the fruit list repopulates
+    if AUTO_OPEN_SHOP then
+        print("🔓 Looking for shop triggers...")
+        ShopTriggers = findShopTriggers()
+        print("🔓 Found " .. #ShopTriggers.prompts .. " prompts, "
+            .. #ShopTriggers.clicks .. " click detectors")
+        if openShop() then print("🔓 Shop trigger fired") else
+            print("⚠️ No shop trigger fired - check the keyword list") end
+        wait(2)
+    end
+
     -- Wait for the fruit list to build and show at least one stocked fruit
     waited = 0
     while waited < 90 do
@@ -327,6 +409,7 @@ local function startMonitoring()
         if isReady then print("✅ Fruit list populated") break end
         if waited % 10 == 0 then
             print("⏳ No stocked fruits visible yet (" .. waited .. "s)")
+            openShop()
         end
         wait(1); waited = waited + 1
     end
@@ -344,10 +427,17 @@ local function startMonitoring()
     sendHeartbeat(initialData.ready)
     print("🚀 MONITORING LOOP STARTED")
 
+    local lastReopen = os.time()
+
     while true do
         local success, currentData = pcall(collectAllData)
         if success then
             local now = os.time()
+
+            if AUTO_OPEN_SHOP and (now - lastReopen) >= REOPEN_INTERVAL then
+                openShop()
+                lastReopen = now
+            end
             if currentData.ready then
                 local changes = hasChanges(Cache.fruits, currentData.fruits)
                 if sendToAPI(currentData) then

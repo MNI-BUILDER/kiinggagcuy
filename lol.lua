@@ -2,8 +2,8 @@
 -- No UI needed. Reads the MaterialDealer RemoteFunction directly.
 print("⚒️ Material Dealer Monitor starting…")
 
-local API_ENDPOINT    = "http://204.12.233.39:3000/api/stocks/kinglegacy-material"
-local DELETE_ENDPOINT = "http://204.12.233.39:3000/api/stocks/kinglegacy-material"
+local API_ENDPOINT    = "http://204.12.233.39:3000/api/stocks/kinglegacy"
+local DELETE_ENDPOINT = "http://204.12.233.39:3000/api/stocks/kinglegacy"
 local API_KEY         = "GAMERSBERGGAG"
 local DISCORD_WEBHOOK = "https://discord.com/api/webhooks/1375178535198785586/-kGnmx4QJnWlOOqPutLGurRu132ALTTAne8d4MMgNvTJg825vkpT1yU9R_-s74GBDO9z"
 

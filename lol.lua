@@ -1,3 +1,113 @@
+Skip to content
+MNI-BUILDER
+kiinggagcuy
+Repository navigation
+Code
+Issues
+Pull requests
+Agents
+Actions
+Projects
+Wiki
+Security and quality
+Insights
+Settings
+kiinggagcuy
+/
+lol.lua
+in
+main
+
+Edit
+
+Preview
+Indent mode
+
+Spaces
+Indent size
+
+2
+Line wrap mode
+
+No wrap
+Editing lol.lua file contents
+  1
+  2
+  3
+  4
+  5
+  6
+  7
+  8
+  9
+ 10
+ 11
+ 12
+ 13
+ 14
+ 15
+ 16
+ 17
+ 18
+ 19
+ 20
+ 21
+ 22
+ 23
+ 24
+ 25
+ 26
+ 27
+ 28
+ 29
+ 30
+ 31
+ 32
+ 33
+ 34
+ 35
+ 36
+ 37
+ 38
+ 39
+ 40
+ 41
+ 42
+ 43
+ 44
+ 45
+ 46
+ 47
+ 48
+ 49
+ 50
+ 51
+ 52
+ 53
+ 54
+ 55
+ 56
+ 57
+ 58
+ 59
+ 60
+ 61
+ 62
+ 63
+ 64
+ 65
+ 66
+ 67
+ 68
+ 69
+ 70
+ 71
+ 72
+ 73
+ 74
+ 75
+ 76
+ 77
 -- KING LEGACY - DEEP DATA EXTRACT
 -- Goes after the stock TABLE in memory instead of scraping the UI.
 -- Run once. It prints + sends to Discord, then stops.
@@ -75,96 +185,5 @@ local okgc = pcall(function()
         end
     end
 end)
-if not okgc then log("!! getgc unavailable in this executor") end
-log("")
-log("scanned " .. scanned .. " tables, " .. found .. " look like stock")
-
--- ==== 2. THE LOCALSCRIPT THAT BUILDS THE LIST ====
-log("")
-log("========== FRUITFRAME SCRIPT ENV ==========")
-pcall(function()
-    local ff = LocalPlayer.PlayerGui.MainGui.StarterFrame:FindFirstChild("FruitFrame")
-    if not ff then log("!! no FruitFrame") return end
-
-    for _, s in ipairs(ff:GetDescendants()) do
-        if s:IsA("LocalScript") or s:IsA("ModuleScript") then
-            log("  script: " .. s:GetFullName() .. " (" .. s.ClassName .. ")")
-            local okenv = pcall(function()
-                local env = getsenv(s)
-                for k, v in pairs(env) do
-                    if type(v) == "table" then
-                        local isStock, hits = looksLikeStock(v)
-                        if isStock then
-                            log("    ⭐ env." .. tostring(k) .. " (" .. hits .. " hits) = "
-                                .. ser(v):sub(1, 1200))
-                        end
-                    end
-                end
-            end)
-            if not okenv then log("    (getsenv failed - script may not be running)") end
-        end
-    end
-end)
-
--- ==== 3. MODULES THAT HOLD FRUIT DATA ====
-log("")
-log("========== MODULESCRIPTS WITH FRUIT DATA ==========")
-local modCount = 0
-for _, d in ipairs(RS:GetDescendants()) do
-    if d:IsA("ModuleScript") then
-        local l = string.lower(d.Name)
-        if l:find("fruit") or l:find("shop") or l:find("stock") or l:find("market") then
-            modCount = modCount + 1
-            log("  module: " .. d:GetFullName())
-            pcall(function()
-                local m = require(d)
-                if type(m) == "table" then
-                    log("    -> " .. ser(m):sub(1, 1200))
-                end
-            end)
-        end
-    end
-end
-log("  total: " .. modCount)
-
--- ==== 4. LIVE: watch a Status label actually change ====
-log("")
-log("========== WATCHING STATUS CHANGES (30s) ==========")
-pcall(function()
-    local sf = LocalPlayer.PlayerGui.MainGui.StarterFrame.FruitFrame.ScrollingFrame
-    for _, entry in ipairs(sf:GetChildren()) do
-        if entry:IsA("GuiObject") then
-            local st = entry:FindFirstChild("Status", true)
-            if st and st:IsA("TextLabel") then
-                st:GetPropertyChangedSignal("Text"):Connect(function()
-                    log("  CHANGE " .. entry.Name .. " -> [[" .. st.Text .. "]]")
-                end)
-            end
-            entry:GetPropertyChangedSignal("Visible"):Connect(function()
-                log("  VISIBLE " .. entry.Name .. " -> " .. tostring(entry.Visible))
-            end)
-        end
-    end
-end)
-log("  (open the shop now - any change gets logged)")
-wait(30)
-
--- ==== SHIP ====
-local full = table.concat(lines, "\n")
-print("\n=== LENGTH: " .. #full .. " ===")
-local CHUNK, part = 1800, 1
-for i = 1, #full, CHUNK do
-    pcall(function()
-        request({
-            Url = DISCORD_WEBHOOK,
-            Method = "POST",
-            Headers = {["Content-Type"] = "application/json"},
-            Body = HttpService:JSONEncode({
-                content = "**DEEP part " .. part .. "**\n```\n" .. full:sub(i, i + CHUNK - 1) .. "\n```"
-            })
-        })
-    end)
-    part = part + 1
-    wait(0.6)
-end
-print("✅ sent in " .. (part - 1) .. " parts")
+Use Control + Shift + m to toggle the tab key moving focus. Alternatively, use esc then tab to move to the next interactive element on the page.
+ 

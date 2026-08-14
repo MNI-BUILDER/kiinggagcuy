@@ -1,371 +1,195 @@
--- KING LEGACY MONITOR - Black Market Fruit Stock -> /api/stocks/kinglegacy
--- PATH: PlayerGui.MainGui.StarterFrame.FruitFrame.ScrollingFrame
--- STOCK SIGNAL: entry.Visible (the list hides fruits that aren't stocked)
--- READY GATE:   the "Time Until New Fruits" label must show a real clock, not "???"
-print("👑 Starting King Legacy Monitor (Black Market Stock)...")
-
-local API_ENDPOINT     = "http://204.12.233.39:3000/api/stocks/kinglegacy"
-local DELETE_ENDPOINT  = "http://204.12.233.39:3000/api/stocks/kinglegacy"
-local API_KEY          = "GAMERSBERGGAG"
-local DISCORD_WEBHOOK  = "https://discord.com/api/webhooks/1375178535198785586/-kGnmx4QJnWlOOqPutLGurRu132ALTTAne8d4MMgNvTJg825vkpT1yU9R_-s74GBDO9z"
-local CHECK_INTERVAL   = 1
-local HEARTBEAT_INTERVAL = 10
-local DISCORD_UPDATE_INTERVAL = 300
+-- KING LEGACY - REMOTE SPY
+-- 1. Run this script
+-- 2. Walk to the fruit dealer / black market NPC and OPEN THE SHOP once
+-- 3. Read console + Discord for which remote carries the stock
+-- It logs for 120 seconds then stops on its own.
 
 local HttpService = game:GetService("HttpService")
+local RS = game:GetService("ReplicatedStorage")
 local LocalPlayer = game.Players.LocalPlayer
+local DISCORD_WEBHOOK = "https://discord.com/api/webhooks/1375178535198785586/-kGnmx4QJnWlOOqPutLGurRu132ALTTAne8d4MMgNvTJg825vkpT1yU9R_-s74GBDO9z"
 
-local Cache = {
-    sessionId = tostring(os.time()) .. "_" .. tostring(math.random(1000, 9999)),
-    updateCounter = 0,
-    lastHeartbeat = 0,
-    lastDiscordUpdate = 0,
-    fruits = {}
-}
+local SPY_DURATION = 120
+local KEYWORDS = {"fruit", "shop", "market", "stock", "buy", "dealer", "rotate", "restock"}
 
-local IGNORE_PATTERNS = {
-    "_padding", "padding", "uilistlayout", "uigridlayout", "uipadding",
-    "uicorner", "uistroke", "uigradient", "uiaspectratioconstraint",
-    "u: ", "shadow", "bevel", "template", "example", "search"
-}
+local lines = {}
+local function log(s)
+    print(s)
+    table.insert(lines, tostring(s))
+end
 
-local function shouldIgnoreItem(itemName)
-    local lowerName = string.lower(itemName)
-    for _, pattern in ipairs(IGNORE_PATTERNS) do
-        if lowerName:match(pattern) then return true end
+local function pathOf(obj)
+    local parts, cur = {}, obj
+    while cur and cur ~= game do
+        table.insert(parts, 1, cur.Name)
+        cur = cur.Parent
+    end
+    return table.concat(parts, ".")
+end
+
+local function isInteresting(name)
+    local l = string.lower(tostring(name))
+    for _, k in ipairs(KEYWORDS) do
+        if l:find(k, 1, true) then return true end
     end
     return false
 end
 
-local function trim(s)
-    return (tostring(s or ""):gsub("^%s+", ""):gsub("%s+$", ""))
+-- Safe serializer (tables can be deep / cyclic)
+local function ser(v, depth, seen)
+    depth = depth or 0
+    seen = seen or {}
+    local t = type(v)
+    if t == "table" then
+        if seen[v] then return "<cycle>" end
+        if depth > 4 then return "<deep>" end
+        seen[v] = true
+        local out, n = {}, 0
+        for k, val in pairs(v) do
+            n = n + 1
+            if n > 40 then table.insert(out, "...") break end
+            table.insert(out, "[" .. tostring(k) .. "]=" .. ser(val, depth + 1, seen))
+        end
+        return "{" .. table.concat(out, ", ") .. "}"
+    elseif t == "userdata" then
+        local ok, cls = pcall(function() return v.ClassName end)
+        if ok then return "<" .. tostring(cls) .. ":" .. tostring(v) .. ">" end
+        return "<userdata>"
+    elseif t == "string" then
+        return '"' .. v .. '"'
+    end
+    return tostring(v)
 end
 
-local function cleanText(obj)
-    if not obj then return "" end
-    local ok, content = pcall(function() return obj.ContentText end)
-    if ok and content and content ~= "" then return trim(content) end
-    local s = tostring(obj.Text or ""):gsub("<[^<>]*>", "")
-    s = s:gsub("&quot;", '"'):gsub("&apos;", "'")
-    s = s:gsub("&lt;", "<"):gsub("&gt;", ">"):gsub("&amp;", "&")
-    return trim(s)
+-- ==== PART 1: static scan of remotes ====
+log("========== REMOTES IN REPLICATEDSTORAGE ==========")
+local remotes = {}
+for _, d in ipairs(RS:GetDescendants()) do
+    if d:IsA("RemoteFunction") or d:IsA("RemoteEvent") then
+        table.insert(remotes, d)
+        if isInteresting(d.Name) then
+            log("  ⭐ " .. d.ClassName .. "  " .. pathOf(d))
+        end
+    end
+end
+log("  (total remotes: " .. #remotes .. ", starred = name matched a keyword)")
+
+-- ==== PART 2: any replicated stock values sitting in the open ====
+log("")
+log("========== VALUE OBJECTS / FOLDERS THAT LOOK LIKE STOCK ==========")
+local found = 0
+for _, root in ipairs({RS, workspace, game:GetService("Lighting")}) do
+    for _, d in ipairs(root:GetDescendants()) do
+        if isInteresting(d.Name)
+            and (d:IsA("ValueBase") or d:IsA("Folder") or d:IsA("Configuration")) then
+            found = found + 1
+            if found <= 25 then
+                local extra = ""
+                if d:IsA("ValueBase") then extra = " = " .. tostring(d.Value) end
+                log("  " .. d.ClassName .. "  " .. pathOf(d) .. extra)
+            end
+        end
+    end
+end
+log("  total: " .. found)
+
+-- ==== PART 3: live hook ====
+log("")
+log("========== LIVE SPY: OPEN THE SHOP NOW ==========")
+
+local hooked = false
+local oldNamecall
+
+local ok, err = pcall(function()
+    local mt = getrawmetatable(game)
+    setreadonly(mt, false)
+    oldNamecall = mt.__namecall
+
+    mt.__namecall = newcclosure(function(self, ...)
+        local method = getnamecallmethod()
+        local args = {...}
+
+        if (method == "FireServer" or method == "InvokeServer")
+            and typeof(self) == "Instance" then
+            local ok2 = pcall(function()
+                log("→ " .. method .. "  " .. pathOf(self))
+                for i, a in ipairs(args) do
+                    log("      arg" .. i .. " = " .. ser(a))
+                end
+            end)
+
+            if method == "InvokeServer" then
+                local results = {oldNamecall(self, ...)}
+                pcall(function()
+                    log("   ← RETURNED: " .. ser(results))
+                end)
+                return unpack(results)
+            end
+        end
+
+        return oldNamecall(self, ...)
+    end)
+
+    setreadonly(mt, true)
+    hooked = true
+end)
+
+if not hooked then
+    log("!! namecall hook failed: " .. tostring(err))
+    log("!! Your executor may not support getrawmetatable/newcclosure.")
+    log("!! Fallback: manually InvokeServer on the starred remotes above.")
 end
 
-local function findLabel(entry, childName)
-    local direct = entry:FindFirstChild(childName)
-    if direct and (direct:IsA("TextLabel") or direct:IsA("TextButton")) then return direct end
-    local deep = entry:FindFirstChild(childName, true)
-    if deep and (deep:IsA("TextLabel") or deep:IsA("TextButton")) then return deep end
-    return nil
+-- ==== PART 4: brute-force probe any RemoteFunction with a matching name ====
+log("")
+log("========== PROBING REMOTEFUNCTIONS ==========")
+for _, r in ipairs(remotes) do
+    if r:IsA("RemoteFunction") and isInteresting(r.Name) then
+        local ok3, res = pcall(function() return r:InvokeServer() end)
+        if ok3 then
+            log("  " .. pathOf(r) .. " -> " .. ser(res))
+        else
+            local ok4, res2 = pcall(function() return r:InvokeServer("Get") end)
+            if ok4 then
+                log("  " .. pathOf(r) .. " (\"Get\") -> " .. ser(res2))
+            else
+                log("  " .. pathOf(r) .. " -> error: " .. tostring(res))
+            end
+        end
+        wait(0.2)
+    end
 end
 
-local function sendToDiscord(content, isError)
+-- ==== PART 5: wait, then ship ====
+log("")
+log("(spying for " .. SPY_DURATION .. "s - open the shop now)")
+wait(SPY_DURATION)
+
+-- unhook
+pcall(function()
+    local mt = getrawmetatable(game)
+    setreadonly(mt, false)
+    mt.__namecall = oldNamecall
+    setreadonly(mt, true)
+end)
+log("== spy stopped ==")
+
+local full = table.concat(lines, "\n")
+print("\n=== LOG LENGTH: " .. #full .. " chars ===")
+local CHUNK, part = 1800, 1
+for i = 1, #full, CHUNK do
+    local piece = full:sub(i, i + CHUNK - 1)
     pcall(function()
         request({
             Url = DISCORD_WEBHOOK,
             Method = "POST",
             Headers = {["Content-Type"] = "application/json"},
             Body = HttpService:JSONEncode({
-                content = isError and "💥 **ERROR**" or "📊 **UPDATE**",
-                embeds = {{
-                    description = content,
-                    color = isError and 16711680 or 65280,
-                    footer = {text = "Session: " .. Cache.sessionId},
-                    timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ")
-                }}
+                content = "**SPY part " .. part .. "**\n```\n" .. piece .. "\n```"
             })
         })
     end)
+    part = part + 1
+    wait(0.6)
 end
-
-local function autoDeleteOnCrash()
-    pcall(function()
-        request({
-            Url = DELETE_ENDPOINT,
-            Method = "POST",
-            Headers = {
-                ["Content-Type"] = "application/json",
-                ["Authorization"] = API_KEY,
-                ["X-Session-ID"] = Cache.sessionId
-            },
-            Body = HttpService:JSONEncode({
-                action = "DELETE_ALL",
-                sessionId = Cache.sessionId,
-                playerName = LocalPlayer.Name,
-                timestamp = os.time()
-            })
-        })
-    end)
-end
-
--- ==== UI ====
-
-local function getMainGui()
-    local pg = LocalPlayer:FindFirstChild("PlayerGui")
-    return pg and pg:FindFirstChild("MainGui")
-end
-
-local function guiReady()
-    local mainGui = getMainGui()
-    if not mainGui then return false end
-    if mainGui:IsA("ScreenGui") and mainGui.Enabled ~= true then return false end
-    local pg = LocalPlayer:FindFirstChild("PlayerGui")
-    local loading = pg and pg:FindFirstChild("LoadingGUI")
-    if loading and loading:IsA("ScreenGui") and loading.Enabled == true then return false end
-    return true
-end
-
-local function getContainer()
-    local mainGui = getMainGui()
-    if not mainGui then return nil end
-    local starter = mainGui:FindFirstChild("StarterFrame")
-    if not starter then return nil end
-    local fruitFrame = starter:FindFirstChild("FruitFrame")
-    if not fruitFrame then return nil end
-    return fruitFrame:FindFirstChild("ScrollingFrame"), fruitFrame
-end
-
--- "Time Until New Fruits: 03:16:04"  -> real
--- "Time Until New Fruits: ???"       -> shop data hasn't replicated, data is FAKE
-local function getRestock(fruitFrame)
-    local text, seconds, valid = "", 0, false
-    if not fruitFrame then return text, seconds, valid end
-    for _, c in ipairs(fruitFrame:GetDescendants()) do
-        if c:IsA("TextLabel") or c:IsA("TextButton") then
-            local t = cleanText(c)
-            if t:lower():match("fruit") or t:lower():match("restock") then
-                text = t
-                local h, m, s = t:match("(%d+):(%d+):(%d+)")
-                if h then
-                    seconds = tonumber(h) * 3600 + tonumber(m) * 60 + tonumber(s)
-                    valid = true
-                    return text, seconds, valid
-                end
-            end
-        end
-    end
-    return text, seconds, valid
-end
-
-local function parseStatus(statusLabel)
-    local clean = cleanText(statusLabel)
-    local lower = string.lower(clean)
-    if clean == "" or lower:match("loading") then return clean, "loading", 0 end
-    if lower:match("out%s*of%s*stock") or lower:match("sold") then return clean, "out_of_stock", 0 end
-    local price = tonumber((clean:gsub("[^%d]", "")))
-    if price and price > 0 then return clean, "price", price end
-    if lower:match("in%s*stock") then return clean, "in_stock", 0 end
-    return clean, "unknown", 0
-end
-
--- ==== SCRAPE ====
-
-local function collectBlackMarket()
-    local result, listedCount, total = {}, 0, 0
-    local restockText, restockSeconds, restockValid = "", 0, false
-
-    local ok = pcall(function()
-        local container, fruitFrame = getContainer()
-        if not container then return end
-        restockText, restockSeconds, restockValid = getRestock(fruitFrame)
-
-        for _, entry in ipairs(container:GetChildren()) do
-            if entry:IsA("GuiObject") and not shouldIgnoreItem(entry.Name) then
-                local status, state, price = parseStatus(findLabel(entry, "Status"))
-                local displayName = cleanText(findLabel(entry, "TextLabel"))
-                local tierText    = cleanText(findLabel(entry, "Tier"))
-
-                -- THE STOCK SIGNAL: hidden entries are not stocked this rotation.
-                local listed = entry.Visible == true
-                if state == "out_of_stock" then listed = false end
-
-                total = total + 1
-                if listed then listedCount = listedCount + 1 end
-
-                result[entry.Name] = {
-                    name         = (displayName ~= "" and displayName or entry.Name),
-                    tier         = tierText,
-                    inStock      = listed,
-                    stock        = listed and 1 or 0,
-                    catalogPrice = price,      -- base price from the list, NOT the shop price
-                    status       = status,
-                    state        = state
-                }
-            end
-        end
-    end)
-
-    if not ok then return {}, false, 0, "", 0 end
-
-    -- Only trust the scrape when the restock timer is a real clock.
-    -- "???" means the client never got the stock rotation.
-    local isReady = restockValid and total > 0
-    return result, isReady, listedCount, restockText, restockSeconds
-end
-
-local function collectAllData()
-    local fruits, isReady, listedCount, restockText, restockSeconds = collectBlackMarket()
-
-    local inStockNames = {}
-    for _, info in pairs(fruits) do
-        if info.inStock then table.insert(inStockNames, info.name) end
-    end
-    table.sort(inStockNames)
-
-    local data = {
-        sessionId    = Cache.sessionId,
-        timestamp    = os.time(),
-        updateNumber = Cache.updateCounter + 1,
-        playerName   = LocalPlayer.Name,
-        userId       = LocalPlayer.UserId,
-        game         = "kinglegacy",
-        shop         = "blackmarket",
-        ready        = isReady,
-        restock      = {text = restockText, seconds = restockSeconds},
-        inStockList  = inStockNames,
-        fruits       = fruits
-    }
-
-    print("📊 " .. listedCount .. "/" .. #inStockNames .. " stocked ["
-        .. table.concat(inStockNames, ", ") .. "] | READY: " .. tostring(isReady)
-        .. " | " .. (restockText ~= "" and restockText or "no timer"))
-
-    return data
-end
-
--- ==== NETWORK ====
-
-local function sendToAPI(data)
-    local success = pcall(function()
-        Cache.updateCounter = Cache.updateCounter + 1
-        data.updateNumber = Cache.updateCounter
-        request({
-            Url = API_ENDPOINT .. "?session=" .. Cache.sessionId .. "&t=" .. os.time(),
-            Method = "POST",
-            Headers = {
-                ["Content-Type"]  = "application/json",
-                ["Authorization"] = API_KEY,
-                ["Cache-Control"] = "no-cache, no-store, must-revalidate",
-                ["X-Session-ID"]  = Cache.sessionId,
-                ["X-Update-Number"] = tostring(Cache.updateCounter)
-            },
-            Body = HttpService:JSONEncode(data)
-        })
-    end)
-    print(success and ("✅ API UPDATE #" .. Cache.updateCounter)
-                  or ("❌ API FAILED #" .. Cache.updateCounter))
-    return success
-end
-
-local function sendHeartbeat(ready)
-    pcall(function()
-        request({
-            Url = API_ENDPOINT .. "/heartbeat",
-            Method = "POST",
-            Headers = {["Authorization"] = API_KEY, ["X-Session-ID"] = Cache.sessionId},
-            Body = HttpService:JSONEncode({
-                sessionId = Cache.sessionId,
-                status = ready and "ALIVE" or "WAITING",
-                timestamp = os.time()
-            })
-        })
-    end)
-end
-
-local function hasChanges(oldFruits, newFruits)
-    for name, info in pairs(newFruits) do
-        local old = oldFruits[name]
-        if not old then return true end
-        if old.inStock ~= info.inStock or old.state ~= info.state then return true end
-    end
-    for name in pairs(oldFruits) do
-        if newFruits[name] == nil then return true end
-    end
-    return false
-end
-
--- ==== SETUP ====
-
-local function setupCrashDetection()
-    LocalPlayer.AncestryChanged:Connect(function()
-        if not LocalPlayer.Parent then autoDeleteOnCrash() end
-    end)
-end
-
-local function setupAntiAFK()
-    local VirtualUser = game:GetService("VirtualUser")
-    LocalPlayer.Idled:Connect(function()
-        VirtualUser:CaptureController()
-        VirtualUser:ClickButton2(Vector2.new())
-    end)
-end
-
--- ==== MAIN ====
-
-local function startMonitoring()
-    print("👑 KING LEGACY MONITOR | Session: " .. Cache.sessionId)
-
-    setupAntiAFK()
-    setupCrashDetection()
-
-    local waited = 0
-    while not guiReady() and waited < 120 do
-        if waited % 10 == 0 then print("⏳ Waiting for MainGui... " .. waited .. "s") end
-        wait(1); waited = waited + 1
-    end
-
-    -- Wait for the restock timer to stop saying "???"
-    waited = 0
-    while waited < 90 do
-        local _, isReady = collectBlackMarket()
-        if isReady then print("✅ Shop data replicated") break end
-        if waited % 10 == 0 then
-            print("⏳ Timer still '???' - shop data not replicated (" .. waited .. "s)")
-        end
-        wait(1); waited = waited + 1
-    end
-
-    Cache.lastHeartbeat = os.time()
-    Cache.lastDiscordUpdate = os.time()
-
-    local initialData = collectAllData()
-    if initialData.ready then
-        Cache.fruits = initialData.fruits
-        sendToAPI(initialData)
-    else
-        print("⚠️ NOT READY - timer shows '???'. Walk to the Black Market NPC and open the shop.")
-    end
-    sendHeartbeat(initialData.ready)
-    print("🚀 MONITORING LOOP STARTED")
-
-    while true do
-        local success, currentData = pcall(collectAllData)
-        if success then
-            local now = os.time()
-            if currentData.ready then
-                local changes = hasChanges(Cache.fruits, currentData.fruits)
-                if sendToAPI(currentData) then
-                    Cache.fruits = currentData.fruits
-                    if changes then print("🔄 STOCK CHANGED & SENT") end
-                end
-            else
-                print("⏸️ Skipping POST - shop data not replicated")
-            end
-
-            if (now - Cache.lastHeartbeat) >= HEARTBEAT_INTERVAL then
-                sendHeartbeat(currentData.ready); Cache.lastHeartbeat = now
-            end
-            if (now - Cache.lastDiscordUpdate) >= DISCORD_UPDATE_INTERVAL then
-                sendToDiscord("👑 King Legacy Monitor - Update #" .. Cache.updateCounter, false)
-                Cache.lastDiscordUpdate = now
-            end
-        else
-            print("❌ ERROR:", currentData)
-            autoDeleteOnCrash()
-            break
-        end
-        wait(CHECK_INTERVAL)
-    end
-end
-
-startMonitoring()
+print("✅ Sent in " .. (part - 1) .. " parts")

@@ -1,192 +1,369 @@
--- KING LEGACY — MATERIAL DEALER MONITOR -> /api/stocks/kinglegacy?shop=materialdealer
--- No UI needed. Reads the MaterialDealer RemoteFunction directly.
--- View data in browser: http://204.12.233.39:3000/api/stocks/kinglegacy?key=status
-print("⚒️ Material Dealer Monitor starting…")
+-- ═══════════════════════════════════════════════════════════════
+--  KING LEGACY UNIFIED MONITOR
+--  Black Market (fruits) + Material Dealer  ->  /api/stocks/kinglegacy
+--
+--  Black Market  : needs the Black Market UI OPEN on screen.
+--  Material Dealer: no UI needed, reads the RemoteFunction.
+--  Read back: http://204.12.233.39:3000/api/stocks/kinglegacy?key=status
+-- ═══════════════════════════════════════════════════════════════
+print("👑 KING LEGACY UNIFIED MONITOR")
 
+-- ══════════════ CONFIG ══════════════
 local API_ENDPOINT    = "http://204.12.233.39:3000/api/stocks/kinglegacy"
 local DELETE_ENDPOINT = "http://204.12.233.39:3000/api/stocks/kinglegacy"
 local API_KEY         = "GAMERSBERGGAG"
 local DISCORD_WEBHOOK = "https://discord.com/api/webhooks/1375178535198785586/-kGnmx4QJnWlOOqPutLGurRu132ALTTAne8d4MMgNvTJg825vkpT1yU9R_-s74GBDO9z"
 
-local SHOP_TAG            = "materialdealer"
-local CHECK_INTERVAL      = 5
-local HEARTBEAT_INTERVAL  = 30
-local DISCORD_ON_ROTATION = true    -- ping Discord when the 6 items change
+local ENABLE_BLACKMARKET = true
+local ENABLE_MATERIALS   = true
+
+local BM_INTERVAL        = 1      -- black market scrape+post (seconds)
+local MAT_INTERVAL       = 5      -- material dealer poll+post (seconds)
+local HEARTBEAT_INTERVAL = 20
+local STATUS_INTERVAL    = 600    -- periodic Discord "still alive" (0 = off)
+
+local INCLUDE_OUT_OF_STOCK = true  -- fruits: send all with inStock flags
+local DISCORD_ON_CHANGE    = true  -- ping on fruit restock / material rotation
+-- ════════════════════════════════════
 
 local HttpService = game:GetService("HttpService")
 local RS          = game:GetService("ReplicatedStorage")
 local LocalPlayer = game.Players.LocalPlayer
 
-local Chest    = RS:WaitForChild("Chest")
-local Remote   = Chest.Remotes.Functions.MaterialDealer
-local MatList  = require(Chest.Modules.MaterialList)
-local DealerDT = require(Chest.Modules.DealerData)
-
-local Cache = {
-    sessionId = tostring(os.time()) .. "_" .. tostring(math.random(1000, 9999)),
-    updateCounter = 0,
+local Session = {
+    id = tostring(os.time()) .. "_" .. tostring(math.random(1000, 9999)),
+    posts = 0,
+    startedAt = os.time(),
     lastHeartbeat = 0,
-    lastKey = nil,
-    lastTime = nil,
-    timerMode = "unknown"   -- countdown | elapsed | unknown
+    lastStatus = 0
 }
 
-local function fmt(sec)
+-- ═══════════ SHARED HELPERS ═══════════
+local function trim(s) return (tostring(s or ""):gsub("^%s+",""):gsub("%s+$","")) end
+
+local function fmtTime(sec)
     sec = math.max(0, math.floor(tonumber(sec) or 0))
     return string.format("%02d:%02d:%02d", math.floor(sec/3600), math.floor(sec%3600/60), sec%60)
 end
 
 local function comma(n)
     local s = tostring(math.floor(tonumber(n) or 0))
-    local out = s:reverse():gsub("(%d%d%d)", "%1,"):reverse()
-    return (out:gsub("^,", ""))
+    return ((s:reverse():gsub("(%d%d%d)", "%1,"):reverse():gsub("^,", "")))
 end
 
-local function getStock()
-    local ok, res = pcall(function() return Remote:InvokeServer("Get") end)
-    if not ok or type(res) ~= "table" or type(res.Stocks) ~= "table" then
-        return nil, (ok and "bad response" or tostring(res))
+local function post(shopTag, data)
+    return (pcall(function()
+        Session.posts = Session.posts + 1
+        data.updateNumber = Session.posts
+        request({
+            Url = API_ENDPOINT .. "?shop=" .. shopTag
+                .. "&session=" .. Session.id .. "&t=" .. os.time(),
+            Method = "POST",
+            Headers = {["Content-Type"]  = "application/json",
+                ["Authorization"]        = API_KEY,
+                ["Cache-Control"]        = "no-cache, no-store, must-revalidate",
+                ["X-Session-ID"]         = Session.id,
+                ["X-Shop"]               = shopTag,
+                ["X-Update-Number"]      = tostring(Session.posts)},
+            Body = HttpService:JSONEncode(data)
+        })
+    end))
+end
+
+local function discord(title, desc, color)
+    pcall(function()
+        request({
+            Url = DISCORD_WEBHOOK, Method = "POST",
+            Headers = {["Content-Type"] = "application/json"},
+            Body = HttpService:JSONEncode({
+                embeds = {{title = title, description = desc, color = color or 3447003,
+                    footer = {text = "Session: " .. Session.id},
+                    timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ")}}
+            })
+        })
+    end)
+end
+
+local function heartbeat(bmLive, matLive)
+    pcall(function()
+        request({
+            Url = API_ENDPOINT .. "/heartbeat", Method = "POST",
+            Headers = {["Authorization"] = API_KEY, ["X-Session-ID"] = Session.id},
+            Body = HttpService:JSONEncode({
+                sessionId = Session.id, status = "ALIVE", timestamp = os.time(),
+                blackmarket = bmLive, materialdealer = matLive,
+                uptime = os.time() - Session.startedAt
+            })
+        })
+    end)
+end
+
+local function autoDeleteOnCrash()
+    for _, tag in ipairs({"blackmarket", "materialdealer"}) do
+        pcall(function()
+            request({
+                Url = DELETE_ENDPOINT .. "?shop=" .. tag, Method = "POST",
+                Headers = {["Content-Type"] = "application/json",
+                    ["Authorization"] = API_KEY,
+                    ["X-Session-ID"] = Session.id, ["X-Shop"] = tag},
+                Body = HttpService:JSONEncode({action = "DELETE_ALL", shop = tag,
+                    sessionId = Session.id, playerName = LocalPlayer.Name,
+                    timestamp = os.time()})
+            })
+        end)
     end
-    return res, "ok"
 end
 
-local function enrich(name, qty)
-    local info = MatList[name] or {}
-    local tier = info.Tier or "Unknown"
-    local price = DealerDT.Prices and DealerDT.Prices[tier]
-    local stacks = DealerDT.BuyStacks and DealerDT.BuyStacks[tier]
+local function cleanText(obj)
+    if not obj then return "" end
+    local ok, c = pcall(function() return obj.ContentText end)
+    if ok and c and c ~= "" then return trim(c) end
+    local s = tostring(obj.Text or ""):gsub("<[^<>]*>", "")
+    return trim((s:gsub("&lt;", "<"):gsub("&gt;", ">"):gsub("&amp;", "&")))
+end
+
+-- every ancestor visible AND the ScreenGui enabled
+local function onScreen(obj)
+    local cur = obj
+    while cur and cur:IsA("GuiObject") do
+        if not cur.Visible then return false end
+        cur = cur.Parent
+    end
+    if cur and cur:IsA("ScreenGui") then return cur.Enabled == true end
+    return false
+end
+
+-- ═══════════ BLACK MARKET ═══════════
+local BM = {
+    goodFruits = nil, goodAt = 0,
+    goodRestock = {text = "", seconds = 0},
+    lastKey = nil, lastPoll = 0
+}
+
+local IGNORE_PATTERNS = {
+    "_padding", "padding", "uilistlayout", "uigridlayout", "uipadding",
+    "uicorner", "uistroke", "uigradient", "uiaspectratioconstraint",
+    "u: ", "shadow", "bevel", "template", "example", "search"
+}
+
+local function shouldIgnore(n)
+    local l = string.lower(n)
+    for _, p in ipairs(IGNORE_PATTERNS) do if l:match(p) then return true end end
+    return false
+end
+
+local function findLabel(entry, name)
+    local d = entry:FindFirstChild(name)
+    if d and (d:IsA("TextLabel") or d:IsA("TextButton")) then return d end
+    d = entry:FindFirstChild(name, true)
+    if d and (d:IsA("TextLabel") or d:IsA("TextButton")) then return d end
+    return nil
+end
+
+local function getContainer()
+    local pg = LocalPlayer:FindFirstChild("PlayerGui")
+    local mainGui = pg and pg:FindFirstChild("MainGui")
+    if not mainGui then return nil end
+    local starter = mainGui:FindFirstChild("StarterFrame")
+    if not starter then return nil end
+    local ff = starter:FindFirstChild("FruitFrame")
+    if not ff then return nil end
+    return ff:FindFirstChild("ScrollingFrame"), ff
+end
+
+-- restock timer label is a SIBLING of FruitFrame, not a child
+local function getRestock(ff)
+    if not ff then return "", 0 end
+    local roots = {ff}
+    if ff.Parent then table.insert(roots, ff.Parent) end
+    for _, root in ipairs(roots) do
+        for _, c in ipairs(root:GetDescendants()) do
+            if c:IsA("TextLabel") or c:IsA("TextButton") then
+                local t = cleanText(c)
+                local low = t:lower()
+                if (low:match("restock") or low:match("new fruit")) and onScreen(c) then
+                    local h, m, s = t:match("(%d+):(%d+):(%d+)")
+                    if h then return t, tonumber(h)*3600 + tonumber(m)*60 + tonumber(s) end
+                end
+            end
+        end
+    end
+    return "", 0
+end
+
+local function parseStatus(label)
+    local clean = cleanText(label)
+    local lower = string.lower(clean)
+    if clean == "" or lower:match("loading") then return clean, "loading", 0 end
+    if lower:match("out%s*of%s*stock") or lower:match("sold") then return clean, "out_of_stock", 0 end
+    local price = tonumber((clean:gsub("[^%d]", "")))
+    if price and price > 0 then return clean, "price", price end
+    if lower:match("in%s*stock") then return clean, "in_stock", 0 end
+    return clean, "unknown", 0
+end
+
+local function scrapeIfOpen()
+    local container, ff = getContainer()
+    if not container then return nil, "no container" end
+    if not onScreen(container) then return nil, "shop closed" end
+
+    local result, oos, priced, loading = {}, 0, 0, 0
+    for _, entry in ipairs(container:GetChildren()) do
+        if entry:IsA("GuiObject") and not shouldIgnore(entry.Name) then
+            local status, state, price = parseStatus(findLabel(entry, "Status"))
+            local displayName = cleanText(findLabel(entry, "TextLabel"))
+            local tier = cleanText(findLabel(entry, "Tier"))
+
+            if state == "out_of_stock" then oos = oos + 1
+            elseif state == "price" then priced = priced + 1
+            elseif state == "loading" then loading = loading + 1 end
+
+            local inStock = (state == "price" or state == "in_stock")
+            result[entry.Name] = {
+                name = (displayName ~= "" and displayName or entry.Name),
+                tier = tier, status = status, state = state, price = price,
+                inStock = inStock, stock = inStock and 1 or 0, shown = entry.Visible
+            }
+        end
+    end
+
+    -- open but nothing marked out of stock + still loading = stale catalog
+    if oos == 0 and loading > 0 then
+        return nil, "open but still loading (" .. loading .. ")"
+    end
+
+    local rt, rs = getRestock(ff)
+    return {fruits = result, restock = {text = rt, seconds = rs},
+            counts = {outOfStock = oos, priced = priced, loading = loading}}
+end
+
+local function buildBlackMarket()
+    local fresh, reason = scrapeIfOpen()
+    if fresh then
+        BM.goodFruits  = fresh.fruits
+        BM.goodAt      = os.time()
+        BM.goodRestock = fresh.restock
+    end
+    if not BM.goodFruits then return nil, reason end
+
+    local inStockList, outFruits, totalSeen = {}, {}, 0
+    for key, f in pairs(BM.goodFruits) do
+        totalSeen = totalSeen + 1
+        if f.inStock then
+            table.insert(inStockList, f.name)
+            outFruits[key] = f
+        elseif INCLUDE_OUT_OF_STOCK then
+            outFruits[key] = f
+        end
+    end
+    table.sort(inStockList)
+
+    local key = table.concat(inStockList, "|")
+    local changed = (BM.lastKey ~= nil and BM.lastKey ~= key)
+    BM.lastKey = key
+
+    local age = os.time() - BM.goodAt
     return {
-        name       = name,
-        tier       = tier,
-        stock      = qty,
-        stackSize  = stacks,
+        sessionId = Session.id, timestamp = os.time(),
+        playerName = LocalPlayer.Name, userId = LocalPlayer.UserId,
+        game = "kinglegacy", shop = "blackmarket",
+        live = (fresh ~= nil), stale = (age > 5), scrapeAge = age,
+        restock = BM.goodRestock,
+        totalFruits = totalSeen, stockCount = #inStockList,
+        inStockList = inStockList, fruits = outFruits,
+        changed = changed
+    }, (fresh and "live" or reason)
+end
+
+-- ═══════════ MATERIAL DEALER ═══════════
+local MAT = {ok = false, remote = nil, list = nil, data = nil,
+             lastKey = nil, lastTime = nil, timerMode = "unknown", lastPoll = 0}
+
+if ENABLE_MATERIALS then
+    local ok = pcall(function()
+        local chest  = RS:WaitForChild("Chest", 10)
+        MAT.remote   = chest.Remotes.Functions.MaterialDealer
+        MAT.list     = require(chest.Modules.MaterialList)
+        MAT.data     = require(chest.Modules.DealerData)
+    end)
+    MAT.ok = ok and MAT.remote ~= nil
+    if not MAT.ok then warn("⚠️ Material Dealer modules not found — materials disabled") end
+end
+
+local function enrichMaterial(name, qty)
+    local info  = (MAT.list or {})[name] or {}
+    local tier  = info.Tier or "Unknown"
+    local price = MAT.data and MAT.data.Prices and MAT.data.Prices[tier]
+    local stack = MAT.data and MAT.data.BuyStacks and MAT.data.BuyStacks[tier]
+    return {
+        name = name, tier = tier, stock = qty, stackSize = stack,
         priceValue = price and price.Value or 0,
         priceType  = price and price.Type or "",
-        image      = info.Image or "",
-        info       = info.Info or "",
-        isFish     = info.Fish == true,
-        craftable  = (info.CraftList ~= nil)
+        image = info.Image or "", info = info.Info or "",
+        isFish = info.Fish == true, craftable = (info.CraftList ~= nil)
     }
 end
 
-local function buildPayload()
-    local res, reason = getStock()
-    if not res then return nil, reason end
+local function buildMaterials()
+    if not MAT.ok then return nil, "materials disabled" end
+    local ok, res = pcall(function() return MAT.remote:InvokeServer("Get") end)
+    if not ok then return nil, "remote error: " .. tostring(res) end
+    if type(res) ~= "table" or type(res.Stocks) ~= "table" then return nil, "bad response" end
 
     local t = tonumber(res.CurrentTime) or 0
-    if Cache.lastTime then
-        if t < Cache.lastTime then Cache.timerMode = "countdown"
-        elseif t > Cache.lastTime then Cache.timerMode = "elapsed" end
+    if MAT.lastTime then
+        if t < MAT.lastTime then MAT.timerMode = "countdown"
+        elseif t > MAT.lastTime then MAT.timerMode = "elapsed" end
     end
-    Cache.lastTime = t
+    MAT.lastTime = t
 
     local items, names = {}, {}
     for name, qty in pairs(res.Stocks) do
-        table.insert(items, enrich(name, qty))
+        table.insert(items, enrichMaterial(name, qty))
         table.insert(names, name)
     end
     table.sort(names)
     table.sort(items, function(a, b) return a.name < b.name end)
 
     local key = table.concat(names, "|")
-    local rotated = (Cache.lastKey ~= nil and Cache.lastKey ~= key)
-    Cache.lastKey = key
+    local rotated = (MAT.lastKey ~= nil and MAT.lastKey ~= key)
+    MAT.lastKey = key
 
     return {
-        sessionId     = Cache.sessionId,
-        timestamp     = os.time(),
-        updateNumber  = Cache.updateCounter + 1,
-        playerName    = LocalPlayer.Name,
-        userId        = LocalPlayer.UserId,
-        game          = "kinglegacy",
-        shop          = SHOP_TAG,
-        live          = true,
-        currentTime   = t,
-        timerMode     = Cache.timerMode,
-        timerText     = fmt(t),
-        restockAtUnix = (Cache.timerMode ~= "elapsed") and (os.time() + t) or nil,
-        itemCount     = #items,
-        itemList      = names,
-        items         = items,
-        rotated       = rotated
+        sessionId = Session.id, timestamp = os.time(),
+        playerName = LocalPlayer.Name, userId = LocalPlayer.UserId,
+        game = "kinglegacy", shop = "materialdealer",
+        live = true,
+        currentTime = t, timerMode = MAT.timerMode, timerText = fmtTime(t),
+        restockAtUnix = (MAT.timerMode ~= "elapsed") and (os.time() + t) or nil,
+        itemCount = #items, itemList = names, items = items,
+        rotated = rotated
     }, "ok"
 end
 
-local function sendToAPI(data)
-    return (pcall(function()
-        Cache.updateCounter = Cache.updateCounter + 1
-        data.updateNumber = Cache.updateCounter
-        request({
-            Url = API_ENDPOINT .. "?shop=" .. SHOP_TAG
-                .. "&session=" .. Cache.sessionId .. "&t=" .. os.time(),
-            Method = "POST",
-            Headers = {["Content-Type"] = "application/json",
-                ["Authorization"] = API_KEY,
-                ["Cache-Control"] = "no-cache, no-store, must-revalidate",
-                ["X-Session-ID"] = Cache.sessionId,
-                ["X-Shop"] = SHOP_TAG,
-                ["X-Update-Number"] = tostring(Cache.updateCounter)},
-            Body = HttpService:JSONEncode(data)
-        })
-    end))
+-- ═══════════ DISCORD NOTIFY ═══════════
+local function notifyFruits(d)
+    local body = (#d.inStockList > 0)
+        and ("**" .. table.concat(d.inStockList, "**\n**") .. "**")
+        or  "_nothing in stock_"
+    discord("🍎 Black Market — Stock Changed",
+        body .. "\n\n" .. (d.restock.text ~= "" and d.restock.text or "no timer"),
+        16753920)
 end
 
-local function sendHeartbeat()
-    pcall(function()
-        request({
-            Url = API_ENDPOINT .. "/heartbeat?shop=" .. SHOP_TAG,
-            Method = "POST",
-            Headers = {["Authorization"] = API_KEY,
-                ["X-Session-ID"] = Cache.sessionId,
-                ["X-Shop"] = SHOP_TAG},
-            Body = HttpService:JSONEncode({sessionId = Cache.sessionId,
-                shop = SHOP_TAG, status = "ALIVE", timestamp = os.time()})
-        })
-    end)
+local function notifyMaterials(d)
+    local lines = {}
+    for _, it in ipairs(d.items) do
+        local cost = (it.priceType == "Gem")
+            and (it.priceValue .. " 💎") or ("$" .. comma(it.priceValue))
+        table.insert(lines, string.format("**%s** — %s | x%d | %s",
+            it.name, it.tier, it.stock, cost))
+    end
+    discord("⚒️ Material Dealer — New Stock",
+        table.concat(lines, "\n") .. "\n\nResets in " .. d.timerText, 3447003)
 end
 
-local function autoDeleteOnCrash()
-    pcall(function()
-        request({
-            Url = DELETE_ENDPOINT .. "?shop=" .. SHOP_TAG,
-            Method = "POST",
-            Headers = {["Content-Type"] = "application/json",
-                ["Authorization"] = API_KEY,
-                ["X-Session-ID"] = Cache.sessionId,
-                ["X-Shop"] = SHOP_TAG},
-            Body = HttpService:JSONEncode({action = "DELETE_ALL",
-                shop = SHOP_TAG, sessionId = Cache.sessionId,
-                playerName = LocalPlayer.Name, timestamp = os.time()})
-        })
-    end)
-end
-
-local function discordRotation(data)
-    pcall(function()
-        local lines = {}
-        for _, it in ipairs(data.items) do
-            local cost = it.priceType == "Gem"
-                and (it.priceValue .. " 💎")
-                or  ("$" .. comma(it.priceValue))
-            table.insert(lines, string.format("**%s** — %s | x%d | %s",
-                it.name, it.tier, it.stock, cost))
-        end
-        request({
-            Url = DISCORD_WEBHOOK, Method = "POST",
-            Headers = {["Content-Type"] = "application/json"},
-            Body = HttpService:JSONEncode({
-                embeds = {{
-                    title = "⚒️ Material Dealer — New Stock",
-                    description = table.concat(lines, "\n"),
-                    color = 3447003,
-                    footer = {text = "Resets in " .. data.timerText .. " | " .. Cache.sessionId},
-                    timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ")
-                }}
-            })
-        })
-    end)
-end
-
+-- ═══════════ MAIN ═══════════
 local function setupAntiAFK()
     local VirtualUser = game:GetService("VirtualUser")
     LocalPlayer.Idled:Connect(function()
@@ -195,50 +372,96 @@ local function setupAntiAFK()
     end)
 end
 
--- ==== MAIN ====
 setupAntiAFK()
 LocalPlayer.AncestryChanged:Connect(function()
     if not LocalPlayer.Parent then autoDeleteOnCrash() end
 end)
 
-print("=====================================")
-print("  Material Dealer Monitor — no UI needed")
-print("  POST -> " .. API_ENDPOINT .. "?shop=" .. SHOP_TAG)
-print("=====================================")
+print("═══════════════════════════════════════")
+print("  Black Market : " .. (ENABLE_BLACKMARKET and "ON — OPEN THE UI" or "off"))
+print("  Materials    : " .. (ENABLE_MATERIALS and (MAT.ok and "ON — no UI needed" or "FAILED") or "off"))
+print("  POST -> " .. API_ENDPOINT)
+print("  Session: " .. Session.id)
+print("═══════════════════════════════════════")
 
-Cache.lastHeartbeat = os.time()
-local lastReason = ""
+Session.lastHeartbeat = os.time()
+Session.lastStatus = os.time()
+
+local lastBMReason, bmLive, matLive = "", false, false
 
 while true do
-    local ok, data, reason = pcall(buildPayload)
+    local now = os.time()
 
-    if ok and data then
-        print(string.format("🟢 %d items [%s] | timer %s (%s)",
-            data.itemCount, table.concat(data.itemList, ", "),
-            data.timerText, data.timerMode))
-
-        if sendToAPI(data) then
-            print("   ✅ POST #" .. Cache.updateCounter)
+    -- ── BLACK MARKET ──
+    if ENABLE_BLACKMARKET and (now - BM.lastPoll) >= BM_INTERVAL then
+        BM.lastPoll = now
+        local ok, data, reason = pcall(buildBlackMarket)
+        if ok and data then
+            bmLive = data.live
+            print(string.format("%s BM %d/%d [%s] | %s",
+                data.live and "🟢" or ("🟡" .. data.scrapeAge .. "s"),
+                data.stockCount, data.totalFruits,
+                table.concat(data.inStockList, ", "),
+                data.restock.text ~= "" and data.restock.text or "no timer"))
+            if post("blackmarket", data) then
+                print("   ✅ BM post #" .. Session.posts)
+            else
+                print("   ❌ BM post failed")
+            end
+            if data.changed and DISCORD_ON_CHANGE then
+                print("   🔄 BM STOCK CHANGED")
+                notifyFruits(data)
+            end
         else
-            print("   ❌ POST failed")
-        end
-
-        if data.rotated and DISCORD_ON_ROTATION then
-            print("   🔄 ROTATION DETECTED")
-            discordRotation(data)
-        end
-
-        if (os.time() - Cache.lastHeartbeat) >= HEARTBEAT_INTERVAL then
-            sendHeartbeat()
-            Cache.lastHeartbeat = os.time()
-        end
-    else
-        local r = tostring(reason or data)
-        if r ~= lastReason then
-            print("⏸️ " .. r)
-            lastReason = r
+            bmLive = false
+            local r = tostring(reason or data)
+            if r ~= lastBMReason then
+                print("⏸️ BM: " .. r .. " — open the Black Market UI")
+                lastBMReason = r
+            end
         end
     end
 
-    wait(CHECK_INTERVAL)
+    -- ── MATERIAL DEALER ──
+    if ENABLE_MATERIALS and MAT.ok and (now - MAT.lastPoll) >= MAT_INTERVAL then
+        MAT.lastPoll = now
+        local ok, data, reason = pcall(buildMaterials)
+        if ok and data then
+            matLive = true
+            print(string.format("🟢 MAT %d items [%s] | %s (%s)",
+                data.itemCount, table.concat(data.itemList, ", "),
+                data.timerText, data.timerMode))
+            if post("materialdealer", data) then
+                print("   ✅ MAT post #" .. Session.posts)
+            else
+                print("   ❌ MAT post failed")
+            end
+            if data.rotated and DISCORD_ON_CHANGE then
+                print("   🔄 MAT ROTATION")
+                notifyMaterials(data)
+            end
+        else
+            matLive = false
+            print("⏸️ MAT: " .. tostring(reason or data))
+        end
+    end
+
+    -- ── HEARTBEAT / STATUS ──
+    if (now - Session.lastHeartbeat) >= HEARTBEAT_INTERVAL then
+        heartbeat(bmLive, matLive)
+        Session.lastHeartbeat = now
+    end
+
+    if STATUS_INTERVAL > 0 and (now - Session.lastStatus) >= STATUS_INTERVAL then
+        discord("👑 King Legacy Monitor — Alive",
+            string.format("Posts: **%d**\nBlack Market: %s\nMaterials: %s\nUptime: %s",
+                Session.posts,
+                bmLive and "🟢 live" or "🔴 UI closed",
+                matLive and "🟢 live" or "🔴 error",
+                fmtTime(now - Session.startedAt)),
+            65280)
+        Session.lastStatus = now
+    end
+
+    wait(0.5)
 end

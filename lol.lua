@@ -1,5 +1,6 @@
--- KING LEGACY — MATERIAL DEALER MONITOR -> /api/stocks/kinglegacy-material
+-- KING LEGACY — MATERIAL DEALER MONITOR -> /api/stocks/kinglegacy?shop=materialdealer
 -- No UI needed. Reads the MaterialDealer RemoteFunction directly.
+-- View data in browser: http://204.12.233.39:3000/api/stocks/kinglegacy?key=status
 print("⚒️ Material Dealer Monitor starting…")
 
 local API_ENDPOINT    = "http://204.12.233.39:3000/api/stocks/kinglegacy"
@@ -7,6 +8,7 @@ local DELETE_ENDPOINT = "http://204.12.233.39:3000/api/stocks/kinglegacy"
 local API_KEY         = "GAMERSBERGGAG"
 local DISCORD_WEBHOOK = "https://discord.com/api/webhooks/1375178535198785586/-kGnmx4QJnWlOOqPutLGurRu132ALTTAne8d4MMgNvTJg825vkpT1yU9R_-s74GBDO9z"
 
+local SHOP_TAG            = "materialdealer"
 local CHECK_INTERVAL      = 5
 local HEARTBEAT_INTERVAL  = 30
 local DISCORD_ON_ROTATION = true    -- ping Discord when the 6 items change
@@ -71,7 +73,6 @@ local function buildPayload()
     local res, reason = getStock()
     if not res then return nil, reason end
 
-    -- timer direction detection
     local t = tonumber(res.CurrentTime) or 0
     if Cache.lastTime then
         if t < Cache.lastTime then Cache.timerMode = "countdown"
@@ -98,7 +99,7 @@ local function buildPayload()
         playerName    = LocalPlayer.Name,
         userId        = LocalPlayer.UserId,
         game          = "kinglegacy",
-        shop          = "materialdealer",
+        shop          = SHOP_TAG,
         live          = true,
         currentTime   = t,
         timerMode     = Cache.timerMode,
@@ -116,12 +117,14 @@ local function sendToAPI(data)
         Cache.updateCounter = Cache.updateCounter + 1
         data.updateNumber = Cache.updateCounter
         request({
-            Url = API_ENDPOINT .. "?session=" .. Cache.sessionId .. "&t=" .. os.time(),
+            Url = API_ENDPOINT .. "?shop=" .. SHOP_TAG
+                .. "&session=" .. Cache.sessionId .. "&t=" .. os.time(),
             Method = "POST",
             Headers = {["Content-Type"] = "application/json",
                 ["Authorization"] = API_KEY,
                 ["Cache-Control"] = "no-cache, no-store, must-revalidate",
                 ["X-Session-ID"] = Cache.sessionId,
+                ["X-Shop"] = SHOP_TAG,
                 ["X-Update-Number"] = tostring(Cache.updateCounter)},
             Body = HttpService:JSONEncode(data)
         })
@@ -131,10 +134,13 @@ end
 local function sendHeartbeat()
     pcall(function()
         request({
-            Url = API_ENDPOINT .. "/heartbeat", Method = "POST",
-            Headers = {["Authorization"] = API_KEY, ["X-Session-ID"] = Cache.sessionId},
+            Url = API_ENDPOINT .. "/heartbeat?shop=" .. SHOP_TAG,
+            Method = "POST",
+            Headers = {["Authorization"] = API_KEY,
+                ["X-Session-ID"] = Cache.sessionId,
+                ["X-Shop"] = SHOP_TAG},
             Body = HttpService:JSONEncode({sessionId = Cache.sessionId,
-                status = "ALIVE", timestamp = os.time()})
+                shop = SHOP_TAG, status = "ALIVE", timestamp = os.time()})
         })
     end)
 end
@@ -142,12 +148,15 @@ end
 local function autoDeleteOnCrash()
     pcall(function()
         request({
-            Url = DELETE_ENDPOINT, Method = "POST",
+            Url = DELETE_ENDPOINT .. "?shop=" .. SHOP_TAG,
+            Method = "POST",
             Headers = {["Content-Type"] = "application/json",
-                ["Authorization"] = API_KEY, ["X-Session-ID"] = Cache.sessionId},
+                ["Authorization"] = API_KEY,
+                ["X-Session-ID"] = Cache.sessionId,
+                ["X-Shop"] = SHOP_TAG},
             Body = HttpService:JSONEncode({action = "DELETE_ALL",
-                sessionId = Cache.sessionId, playerName = LocalPlayer.Name,
-                timestamp = os.time()})
+                shop = SHOP_TAG, sessionId = Cache.sessionId,
+                playerName = LocalPlayer.Name, timestamp = os.time()})
         })
     end)
 end
@@ -194,6 +203,7 @@ end)
 
 print("=====================================")
 print("  Material Dealer Monitor — no UI needed")
+print("  POST -> " .. API_ENDPOINT .. "?shop=" .. SHOP_TAG)
 print("=====================================")
 
 Cache.lastHeartbeat = os.time()

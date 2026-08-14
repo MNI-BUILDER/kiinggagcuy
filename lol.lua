@@ -1,467 +1,170 @@
--- KING LEGACY MONITOR - Black Market Fruit Stock -> /api/stocks/kinglegacy
--- PATH: PlayerGui.MainGui.StarterFrame.FruitFrame.ScrollingFrame
--- STOCK SIGNAL: entry.Visible (the list hides fruits that aren't stocked)
--- READY GATE:   the "Time Until New Fruits" label must show a real clock, not "???"
-print("👑 Starting King Legacy Monitor (Black Market Stock)...")
-
-local API_ENDPOINT     = "http://204.12.233.39:3000/api/stocks/kinglegacy"
-local DELETE_ENDPOINT  = "http://204.12.233.39:3000/api/stocks/kinglegacy"
-local API_KEY          = "GAMERSBERGGAG"
-local DISCORD_WEBHOOK  = "https://discord.com/api/webhooks/1375178535198785586/-kGnmx4QJnWlOOqPutLGurRu132ALTTAne8d4MMgNvTJg825vkpT1yU9R_-s74GBDO9z"
-local CHECK_INTERVAL   = 1
-local HEARTBEAT_INTERVAL = 10
-local DISCORD_UPDATE_INTERVAL = 300
-
--- The "Time Until New Fruits" label only resolves while the shop UI is open,
--- so it can't gate an AFK monitor. Visible-based stock works without it.
--- Set true only if you want to hard-require the timer.
-local REQUIRE_TIMER = false
-
--- FruitFrame is shared by multiple shops and only repopulates when a shop opens.
--- So we fire the Black Market NPC's prompt ourselves on a timer.
-local AUTO_OPEN_SHOP  = true
-local REOPEN_INTERVAL = 20      -- seconds between re-opens
-local SHOP_KEYWORDS   = {"black market", "blackmarket", "fruit", "dealer", "market"}
+-- KING LEGACY - DEEP DATA EXTRACT
+-- Goes after the stock TABLE in memory instead of scraping the UI.
+-- Run once. It prints + sends to Discord, then stops.
 
 local HttpService = game:GetService("HttpService")
+local RS = game:GetService("ReplicatedStorage")
 local LocalPlayer = game.Players.LocalPlayer
+local DISCORD_WEBHOOK = "https://discord.com/api/webhooks/1375178535198785586/-kGnmx4QJnWlOOqPutLGurRu132ALTTAne8d4MMgNvTJg825vkpT1yU9R_-s74GBDO9z"
 
-local Cache = {
-    sessionId = tostring(os.time()) .. "_" .. tostring(math.random(1000, 9999)),
-    updateCounter = 0,
-    lastHeartbeat = 0,
-    lastDiscordUpdate = 0,
-    fruits = {}
-}
+-- Fruits we KNOW are entry names - used to fingerprint the right table
+local FINGERPRINT = {"DragonDragon", "SpinSpin", "BombBomb", "PterPter", "MagmaMagma",
+                     "Dragon", "Spin", "Bomb", "Pter", "Magma", "Leopard", "Phoenix"}
 
-local IGNORE_PATTERNS = {
-    "_padding", "padding", "uilistlayout", "uigridlayout", "uipadding",
-    "uicorner", "uistroke", "uigradient", "uiaspectratioconstraint",
-    "u: ", "shadow", "bevel", "template", "example", "search"
-}
+local lines = {}
+local function log(s)
+    print(s)
+    table.insert(lines, tostring(s))
+end
 
-local function shouldIgnoreItem(itemName)
-    local lowerName = string.lower(itemName)
-    for _, pattern in ipairs(IGNORE_PATTERNS) do
-        if lowerName:match(pattern) then return true end
+local function ser(v, depth, seen)
+    depth = depth or 0
+    seen = seen or {}
+    local t = type(v)
+    if t == "table" then
+        if seen[v] then return "<cycle>" end
+        if depth > 3 then return "<deep>" end
+        seen[v] = true
+        local out, n = {}, 0
+        for k, val in pairs(v) do
+            n = n + 1
+            if n > 50 then table.insert(out, "...") break end
+            table.insert(out, "[" .. tostring(k) .. "]=" .. ser(val, depth + 1, seen))
+        end
+        return "{" .. table.concat(out, ", ") .. "}"
+    elseif t == "userdata" then
+        local ok, cls = pcall(function() return v.ClassName end)
+        return ok and ("<" .. tostring(cls) .. ">") or "<userdata>"
+    elseif t == "string" then
+        return '"' .. v .. '"'
     end
-    return false
+    return tostring(v)
 end
 
-local function trim(s)
-    return (tostring(s or ""):gsub("^%s+", ""):gsub("%s+$", ""))
+-- does this table mention fruits?
+local function looksLikeStock(tbl)
+    local hits = 0
+    local ok = pcall(function()
+        for k, v in pairs(tbl) do
+            local ks, vs = tostring(k), tostring(v)
+            for _, f in ipairs(FINGERPRINT) do
+                if ks == f or vs == f then hits = hits + 1 break end
+            end
+            if hits >= 3 then return end
+        end
+    end)
+    return ok and hits >= 3, hits
 end
 
-local function cleanText(obj)
-    if not obj then return "" end
-    local ok, content = pcall(function() return obj.ContentText end)
-    if ok and content and content ~= "" then return trim(content) end
-    local s = tostring(obj.Text or ""):gsub("<[^<>]*>", "")
-    s = s:gsub("&quot;", '"'):gsub("&apos;", "'")
-    s = s:gsub("&lt;", "<"):gsub("&gt;", ">"):gsub("&amp;", "&")
-    return trim(s)
-end
+-- ==== 1. GC SCAN: find the stock table in memory ====
+log("========== GC SCAN FOR STOCK TABLES ==========")
+local scanned, found = 0, 0
+local okgc = pcall(function()
+    for _, obj in pairs(getgc(true)) do
+        if type(obj) == "table" then
+            scanned = scanned + 1
+            local isStock, hits = looksLikeStock(obj)
+            if isStock then
+                found = found + 1
+                if found <= 8 then
+                    log("")
+                    log(">>> TABLE #" .. found .. " (" .. hits .. " fruit keys)")
+                    log("    " .. ser(obj):sub(1, 1500))
+                end
+            end
+        end
+    end
+end)
+if not okgc then log("!! getgc unavailable in this executor") end
+log("")
+log("scanned " .. scanned .. " tables, " .. found .. " look like stock")
 
-local function findLabel(entry, childName)
-    local direct = entry:FindFirstChild(childName)
-    if direct and (direct:IsA("TextLabel") or direct:IsA("TextButton")) then return direct end
-    local deep = entry:FindFirstChild(childName, true)
-    if deep and (deep:IsA("TextLabel") or deep:IsA("TextButton")) then return deep end
-    return nil
-end
+-- ==== 2. THE LOCALSCRIPT THAT BUILDS THE LIST ====
+log("")
+log("========== FRUITFRAME SCRIPT ENV ==========")
+pcall(function()
+    local ff = LocalPlayer.PlayerGui.MainGui.StarterFrame:FindFirstChild("FruitFrame")
+    if not ff then log("!! no FruitFrame") return end
 
-local function sendToDiscord(content, isError)
+    for _, s in ipairs(ff:GetDescendants()) do
+        if s:IsA("LocalScript") or s:IsA("ModuleScript") then
+            log("  script: " .. s:GetFullName() .. " (" .. s.ClassName .. ")")
+            local okenv = pcall(function()
+                local env = getsenv(s)
+                for k, v in pairs(env) do
+                    if type(v) == "table" then
+                        local isStock, hits = looksLikeStock(v)
+                        if isStock then
+                            log("    ⭐ env." .. tostring(k) .. " (" .. hits .. " hits) = "
+                                .. ser(v):sub(1, 1200))
+                        end
+                    end
+                end
+            end)
+            if not okenv then log("    (getsenv failed - script may not be running)") end
+        end
+    end
+end)
+
+-- ==== 3. MODULES THAT HOLD FRUIT DATA ====
+log("")
+log("========== MODULESCRIPTS WITH FRUIT DATA ==========")
+local modCount = 0
+for _, d in ipairs(RS:GetDescendants()) do
+    if d:IsA("ModuleScript") then
+        local l = string.lower(d.Name)
+        if l:find("fruit") or l:find("shop") or l:find("stock") or l:find("market") then
+            modCount = modCount + 1
+            log("  module: " .. d:GetFullName())
+            pcall(function()
+                local m = require(d)
+                if type(m) == "table" then
+                    log("    -> " .. ser(m):sub(1, 1200))
+                end
+            end)
+        end
+    end
+end
+log("  total: " .. modCount)
+
+-- ==== 4. LIVE: watch a Status label actually change ====
+log("")
+log("========== WATCHING STATUS CHANGES (30s) ==========")
+pcall(function()
+    local sf = LocalPlayer.PlayerGui.MainGui.StarterFrame.FruitFrame.ScrollingFrame
+    for _, entry in ipairs(sf:GetChildren()) do
+        if entry:IsA("GuiObject") then
+            local st = entry:FindFirstChild("Status", true)
+            if st and st:IsA("TextLabel") then
+                st:GetPropertyChangedSignal("Text"):Connect(function()
+                    log("  CHANGE " .. entry.Name .. " -> [[" .. st.Text .. "]]")
+                end)
+            end
+            entry:GetPropertyChangedSignal("Visible"):Connect(function()
+                log("  VISIBLE " .. entry.Name .. " -> " .. tostring(entry.Visible))
+            end)
+        end
+    end
+end)
+log("  (open the shop now - any change gets logged)")
+wait(30)
+
+-- ==== SHIP ====
+local full = table.concat(lines, "\n")
+print("\n=== LENGTH: " .. #full .. " ===")
+local CHUNK, part = 1800, 1
+for i = 1, #full, CHUNK do
     pcall(function()
         request({
             Url = DISCORD_WEBHOOK,
             Method = "POST",
             Headers = {["Content-Type"] = "application/json"},
             Body = HttpService:JSONEncode({
-                content = isError and "💥 **ERROR**" or "📊 **UPDATE**",
-                embeds = {{
-                    description = content,
-                    color = isError and 16711680 or 65280,
-                    footer = {text = "Session: " .. Cache.sessionId},
-                    timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ")
-                }}
+                content = "**DEEP part " .. part .. "**\n```\n" .. full:sub(i, i + CHUNK - 1) .. "\n```"
             })
         })
     end)
+    part = part + 1
+    wait(0.6)
 end
-
-local function autoDeleteOnCrash()
-    pcall(function()
-        request({
-            Url = DELETE_ENDPOINT,
-            Method = "POST",
-            Headers = {
-                ["Content-Type"] = "application/json",
-                ["Authorization"] = API_KEY,
-                ["X-Session-ID"] = Cache.sessionId
-            },
-            Body = HttpService:JSONEncode({
-                action = "DELETE_ALL",
-                sessionId = Cache.sessionId,
-                playerName = LocalPlayer.Name,
-                timestamp = os.time()
-            })
-        })
-    end)
-end
-
--- ==== UI ====
-
-local function getMainGui()
-    local pg = LocalPlayer:FindFirstChild("PlayerGui")
-    return pg and pg:FindFirstChild("MainGui")
-end
-
-local function guiReady()
-    local mainGui = getMainGui()
-    if not mainGui then return false end
-    if mainGui:IsA("ScreenGui") and mainGui.Enabled ~= true then return false end
-    local pg = LocalPlayer:FindFirstChild("PlayerGui")
-    local loading = pg and pg:FindFirstChild("LoadingGUI")
-    if loading and loading:IsA("ScreenGui") and loading.Enabled == true then return false end
-    return true
-end
-
-local function getContainer()
-    local mainGui = getMainGui()
-    if not mainGui then return nil end
-    local starter = mainGui:FindFirstChild("StarterFrame")
-    if not starter then return nil end
-    local fruitFrame = starter:FindFirstChild("FruitFrame")
-    if not fruitFrame then return nil end
-    return fruitFrame:FindFirstChild("ScrollingFrame"), fruitFrame
-end
-
--- "Time Until New Fruits: 03:16:04"  -> real
--- "Time Until New Fruits: ???"       -> shop data hasn't replicated, data is FAKE
-local function getRestock(fruitFrame)
-    local text, seconds, valid = "", 0, false
-    if not fruitFrame then return text, seconds, valid end
-    for _, c in ipairs(fruitFrame:GetDescendants()) do
-        if c:IsA("TextLabel") or c:IsA("TextButton") then
-            local t = cleanText(c)
-            if t:lower():match("fruit") or t:lower():match("restock") then
-                text = t
-                local h, m, s = t:match("(%d+):(%d+):(%d+)")
-                if h then
-                    seconds = tonumber(h) * 3600 + tonumber(m) * 60 + tonumber(s)
-                    valid = true
-                    return text, seconds, valid
-                end
-            end
-        end
-    end
-    return text, seconds, valid
-end
-
--- ==== SHOP OPENER ====
--- The fruit list only refreshes when a shop actually opens, so trigger it.
-
-local function matchesShop(text)
-    local l = string.lower(tostring(text or ""))
-    for _, k in ipairs(SHOP_KEYWORDS) do
-        if l:find(k, 1, true) then return true end
-    end
-    return false
-end
-
-local ShopTriggers = nil
-
-local function findShopTriggers()
-    local prompts, clicks = {}, {}
-    pcall(function()
-        for _, d in ipairs(workspace:GetDescendants()) do
-            if d:IsA("ProximityPrompt") then
-                local label = (d.ObjectText or "") .. " " .. (d.ActionText or "")
-                    .. " " .. d.Name .. " " .. (d.Parent and d.Parent.Name or "")
-                    .. " " .. (d.Parent and d.Parent.Parent and d.Parent.Parent.Name or "")
-                if matchesShop(label) then
-                    table.insert(prompts, d)
-                    print("🔎 prompt: " .. d.Name .. " @ "
-                        .. (d.Parent and d.Parent:GetFullName() or "?")
-                        .. " [" .. tostring(d.ObjectText) .. " / " .. tostring(d.ActionText) .. "]")
-                end
-            elseif d:IsA("ClickDetector") then
-                local label = d.Name .. " " .. (d.Parent and d.Parent.Name or "")
-                    .. " " .. (d.Parent and d.Parent.Parent and d.Parent.Parent.Name or "")
-                if matchesShop(label) then
-                    table.insert(clicks, d)
-                    print("🔎 click: " .. (d.Parent and d.Parent:GetFullName() or "?"))
-                end
-            end
-        end
-    end)
-    return {prompts = prompts, clicks = clicks}
-end
-
-local function openShop()
-    if not AUTO_OPEN_SHOP then return false end
-    if not ShopTriggers then ShopTriggers = findShopTriggers() end
-
-    local fired = false
-
-    for _, p in ipairs(ShopTriggers.prompts) do
-        pcall(function()
-            -- local-only property change so distance doesn't block us
-            p.MaxActivationDistance = 1000
-            p.RequiresLineOfSight = false
-            p.HoldDuration = 0
-        end)
-        local ok = pcall(function() fireproximityprompt(p) end)
-        if ok then fired = true end
-    end
-
-    for _, c in ipairs(ShopTriggers.clicks) do
-        local ok = pcall(function() fireclickdetector(c) end)
-        if ok then fired = true end
-    end
-
-    return fired
-end
-
-local function parseStatus(statusLabel)
-    local clean = cleanText(statusLabel)
-    local lower = string.lower(clean)
-    if clean == "" or lower:match("loading") then return clean, "loading", 0 end
-    if lower:match("out%s*of%s*stock") or lower:match("sold") then return clean, "out_of_stock", 0 end
-    local price = tonumber((clean:gsub("[^%d]", "")))
-    if price and price > 0 then return clean, "price", price end
-    if lower:match("in%s*stock") then return clean, "in_stock", 0 end
-    return clean, "unknown", 0
-end
-
--- ==== SCRAPE ====
-
-local function collectBlackMarket()
-    local result, listedCount, total = {}, 0, 0
-    local restockText, restockSeconds, restockValid = "", 0, false
-
-    local ok = pcall(function()
-        local container, fruitFrame = getContainer()
-        if not container then return end
-        restockText, restockSeconds, restockValid = getRestock(fruitFrame)
-
-        for _, entry in ipairs(container:GetChildren()) do
-            if entry:IsA("GuiObject") and not shouldIgnoreItem(entry.Name) then
-                local status, state, price = parseStatus(findLabel(entry, "Status"))
-                local displayName = cleanText(findLabel(entry, "TextLabel"))
-                local tierText    = cleanText(findLabel(entry, "Tier"))
-
-                -- THE STOCK SIGNAL: hidden entries are not stocked this rotation.
-                local listed = entry.Visible == true
-                if state == "out_of_stock" then listed = false end
-
-                total = total + 1
-                if listed then listedCount = listedCount + 1 end
-
-                result[entry.Name] = {
-                    name         = (displayName ~= "" and displayName or entry.Name),
-                    tier         = tierText,
-                    inStock      = listed,
-                    stock        = listed and 1 or 0,
-                    catalogPrice = price,      -- base price from the list, NOT the shop price
-                    status       = status,
-                    state        = state
-                }
-            end
-        end
-    end)
-
-    if not ok then return {}, false, 0, "", 0 end
-
-    -- Ready = the list is built and at least one fruit is showing.
-    -- The timer is reported but no longer required.
-    local isReady = (total > 0) and (listedCount > 0)
-    if REQUIRE_TIMER then isReady = isReady and restockValid end
-    return result, isReady, listedCount, restockText, restockSeconds, restockValid
-end
-
-local function collectAllData()
-    local fruits, isReady, listedCount, restockText, restockSeconds, restockValid = collectBlackMarket()
-
-    local inStockNames = {}
-    for _, info in pairs(fruits) do
-        if info.inStock then table.insert(inStockNames, info.name) end
-    end
-    table.sort(inStockNames)
-
-    local data = {
-        sessionId    = Cache.sessionId,
-        timestamp    = os.time(),
-        updateNumber = Cache.updateCounter + 1,
-        playerName   = LocalPlayer.Name,
-        userId       = LocalPlayer.UserId,
-        game         = "kinglegacy",
-        shop         = "blackmarket",
-        ready        = isReady,
-        restock      = {text = restockText, seconds = restockSeconds, valid = restockValid or false},
-        inStockList  = inStockNames,
-        fruits       = fruits
-    }
-
-    print("📊 " .. listedCount .. "/" .. #inStockNames .. " stocked ["
-        .. table.concat(inStockNames, ", ") .. "] | READY: " .. tostring(isReady)
-        .. " | " .. (restockText ~= "" and restockText or "no timer"))
-
-    return data
-end
-
--- ==== NETWORK ====
-
-local function sendToAPI(data)
-    local success = pcall(function()
-        Cache.updateCounter = Cache.updateCounter + 1
-        data.updateNumber = Cache.updateCounter
-        request({
-            Url = API_ENDPOINT .. "?session=" .. Cache.sessionId .. "&t=" .. os.time(),
-            Method = "POST",
-            Headers = {
-                ["Content-Type"]  = "application/json",
-                ["Authorization"] = API_KEY,
-                ["Cache-Control"] = "no-cache, no-store, must-revalidate",
-                ["X-Session-ID"]  = Cache.sessionId,
-                ["X-Update-Number"] = tostring(Cache.updateCounter)
-            },
-            Body = HttpService:JSONEncode(data)
-        })
-    end)
-    print(success and ("✅ API UPDATE #" .. Cache.updateCounter)
-                  or ("❌ API FAILED #" .. Cache.updateCounter))
-    return success
-end
-
-local function sendHeartbeat(ready)
-    pcall(function()
-        request({
-            Url = API_ENDPOINT .. "/heartbeat",
-            Method = "POST",
-            Headers = {["Authorization"] = API_KEY, ["X-Session-ID"] = Cache.sessionId},
-            Body = HttpService:JSONEncode({
-                sessionId = Cache.sessionId,
-                status = ready and "ALIVE" or "WAITING",
-                timestamp = os.time()
-            })
-        })
-    end)
-end
-
-local function hasChanges(oldFruits, newFruits)
-    for name, info in pairs(newFruits) do
-        local old = oldFruits[name]
-        if not old then return true end
-        if old.inStock ~= info.inStock or old.state ~= info.state then return true end
-    end
-    for name in pairs(oldFruits) do
-        if newFruits[name] == nil then return true end
-    end
-    return false
-end
-
--- ==== SETUP ====
-
-local function setupCrashDetection()
-    LocalPlayer.AncestryChanged:Connect(function()
-        if not LocalPlayer.Parent then autoDeleteOnCrash() end
-    end)
-end
-
-local function setupAntiAFK()
-    local VirtualUser = game:GetService("VirtualUser")
-    LocalPlayer.Idled:Connect(function()
-        VirtualUser:CaptureController()
-        VirtualUser:ClickButton2(Vector2.new())
-    end)
-end
-
--- ==== MAIN ====
-
-local function startMonitoring()
-    print("👑 KING LEGACY MONITOR | Session: " .. Cache.sessionId)
-
-    setupAntiAFK()
-    setupCrashDetection()
-
-    local waited = 0
-    while not guiReady() and waited < 120 do
-        if waited % 10 == 0 then print("⏳ Waiting for MainGui... " .. waited .. "s") end
-        wait(1); waited = waited + 1
-    end
-
-    -- Trigger the shop so the fruit list repopulates
-    if AUTO_OPEN_SHOP then
-        print("🔓 Looking for shop triggers...")
-        ShopTriggers = findShopTriggers()
-        print("🔓 Found " .. #ShopTriggers.prompts .. " prompts, "
-            .. #ShopTriggers.clicks .. " click detectors")
-        if openShop() then print("🔓 Shop trigger fired") else
-            print("⚠️ No shop trigger fired - check the keyword list") end
-        wait(2)
-    end
-
-    -- Wait for the fruit list to build and show at least one stocked fruit
-    waited = 0
-    while waited < 90 do
-        local _, isReady = collectBlackMarket()
-        if isReady then print("✅ Fruit list populated") break end
-        if waited % 10 == 0 then
-            print("⏳ No stocked fruits visible yet (" .. waited .. "s)")
-            openShop()
-        end
-        wait(1); waited = waited + 1
-    end
-
-    Cache.lastHeartbeat = os.time()
-    Cache.lastDiscordUpdate = os.time()
-
-    local initialData = collectAllData()
-    if initialData.ready then
-        Cache.fruits = initialData.fruits
-        sendToAPI(initialData)
-    else
-        print("⚠️ NOT READY - no stocked fruits visible in the list yet.")
-    end
-    sendHeartbeat(initialData.ready)
-    print("🚀 MONITORING LOOP STARTED")
-
-    local lastReopen = os.time()
-
-    while true do
-        local success, currentData = pcall(collectAllData)
-        if success then
-            local now = os.time()
-
-            if AUTO_OPEN_SHOP and (now - lastReopen) >= REOPEN_INTERVAL then
-                openShop()
-                lastReopen = now
-            end
-            if currentData.ready then
-                local changes = hasChanges(Cache.fruits, currentData.fruits)
-                if sendToAPI(currentData) then
-                    Cache.fruits = currentData.fruits
-                    if changes then print("🔄 STOCK CHANGED & SENT") end
-                end
-            else
-                print("⏸️ Skipping POST - no stocked fruits visible")
-            end
-
-            if (now - Cache.lastHeartbeat) >= HEARTBEAT_INTERVAL then
-                sendHeartbeat(currentData.ready); Cache.lastHeartbeat = now
-            end
-            if (now - Cache.lastDiscordUpdate) >= DISCORD_UPDATE_INTERVAL then
-                sendToDiscord("👑 King Legacy Monitor - Update #" .. Cache.updateCounter, false)
-                Cache.lastDiscordUpdate = now
-            end
-        else
-            print("❌ ERROR:", currentData)
-            autoDeleteOnCrash()
-            break
-        end
-        wait(CHECK_INTERVAL)
-    end
-end
-
-startMonitoring()
+print("✅ sent in " .. (part - 1) .. " parts")

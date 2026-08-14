@@ -1,10 +1,10 @@
 -- ═══════════════════════════════════════════════════════════════
---  KING LEGACY UNIFIED MONITOR  v2
---  Black Market (fruits) + Material Dealer  ->  /api/stocks/kinglegacy
---  Each shop posts under its OWN sessionId so both records coexist.
---  Read back: http://204.12.233.39:3000/api/stocks/kinglegacy?key=status
+--  KING LEGACY UNIFIED MONITOR  v3 — SINGLE MERGED PAYLOAD
+--  One POST containing both shops. No record fighting.
+--  Fruits stay top-level (frontend compat), materials under .materials
+--  Read: http://204.12.233.39:3000/api/stocks/kinglegacy?key=status
 -- ═══════════════════════════════════════════════════════════════
-print("👑 KING LEGACY UNIFIED MONITOR v2")
+print("👑 KING LEGACY UNIFIED MONITOR v3 (merged payload)")
 
 -- ══════════════ CONFIG ══════════════
 local API_ENDPOINT    = "http://204.12.233.39:3000/api/stocks/kinglegacy"
@@ -12,11 +12,9 @@ local DELETE_ENDPOINT = "http://204.12.233.39:3000/api/stocks/kinglegacy"
 local API_KEY         = "GAMERSBERGGAG"
 local DISCORD_WEBHOOK = "https://discord.com/api/webhooks/1375178535198785586/-kGnmx4QJnWlOOqPutLGurRu132ALTTAne8d4MMgNvTJg825vkpT1yU9R_-s74GBDO9z"
 
-local ENABLE_BLACKMARKET = true
 local ENABLE_MATERIALS   = true
-
-local BM_INTERVAL        = 1
-local MAT_INTERVAL       = 5
+local POST_INTERVAL      = 1      -- how often the merged payload goes out
+local MAT_REFRESH        = 5      -- how often the material remote is polled
 local HEARTBEAT_INTERVAL = 20
 local STATUS_INTERVAL    = 600    -- 0 = off
 
@@ -28,19 +26,13 @@ local HttpService = game:GetService("HttpService")
 local RS          = game:GetService("ReplicatedStorage")
 local LocalPlayer = game.Players.LocalPlayer
 
-local BASE_ID = tostring(os.time()) .. "_" .. tostring(math.random(1000, 9999))
-
 local Session = {
-    base      = BASE_ID,
-    bmId      = BASE_ID .. "_BM",     -- ← separate record
-    matId     = BASE_ID .. "_MAT",    -- ← separate record
-    posts     = 0,
-    startedAt = os.time(),
-    lastHeartbeat = 0,
-    lastStatus = 0
+    id = tostring(os.time()) .. "_" .. tostring(math.random(1000, 9999)),
+    posts = 0, startedAt = os.time(),
+    lastPost = 0, lastHeartbeat = 0, lastStatus = 0
 }
 
--- ═══════════ SHARED HELPERS ═══════════
+-- ═══════════ HELPERS ═══════════
 local function trim(s) return (tostring(s or ""):gsub("^%s+",""):gsub("%s+$","")) end
 
 local function fmtTime(sec)
@@ -53,26 +45,6 @@ local function comma(n)
     return ((s:reverse():gsub("(%d%d%d)", "%1,"):reverse():gsub("^,", "")))
 end
 
-local function post(shopTag, sessionId, data)
-    return (pcall(function()
-        Session.posts = Session.posts + 1
-        data.updateNumber = Session.posts
-        data.sessionId = sessionId
-        request({
-            Url = API_ENDPOINT .. "?shop=" .. shopTag
-                .. "&session=" .. sessionId .. "&t=" .. os.time(),
-            Method = "POST",
-            Headers = {["Content-Type"]  = "application/json",
-                ["Authorization"]        = API_KEY,
-                ["Cache-Control"]        = "no-cache, no-store, must-revalidate",
-                ["X-Session-ID"]         = sessionId,
-                ["X-Shop"]               = shopTag,
-                ["X-Update-Number"]      = tostring(Session.posts)},
-            Body = HttpService:JSONEncode(data)
-        })
-    end))
-end
-
 local function discord(title, desc, color)
     pcall(function()
         request({
@@ -80,42 +52,11 @@ local function discord(title, desc, color)
             Headers = {["Content-Type"] = "application/json"},
             Body = HttpService:JSONEncode({
                 embeds = {{title = title, description = desc, color = color or 3447003,
-                    footer = {text = "Session: " .. Session.base},
+                    footer = {text = "Session: " .. Session.id},
                     timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ")}}
             })
         })
     end)
-end
-
-local function heartbeat(shopTag, sessionId, alive)
-    pcall(function()
-        request({
-            Url = API_ENDPOINT .. "/heartbeat?shop=" .. shopTag, Method = "POST",
-            Headers = {["Authorization"] = API_KEY,
-                ["X-Session-ID"] = sessionId, ["X-Shop"] = shopTag},
-            Body = HttpService:JSONEncode({
-                sessionId = sessionId, shop = shopTag,
-                status = alive and "ALIVE" or "IDLE",
-                timestamp = os.time(), uptime = os.time() - Session.startedAt
-            })
-        })
-    end)
-end
-
-local function autoDeleteOnCrash()
-    for tag, sid in pairs({blackmarket = Session.bmId, materialdealer = Session.matId}) do
-        pcall(function()
-            request({
-                Url = DELETE_ENDPOINT .. "?shop=" .. tag, Method = "POST",
-                Headers = {["Content-Type"] = "application/json",
-                    ["Authorization"] = API_KEY,
-                    ["X-Session-ID"] = sid, ["X-Shop"] = tag},
-                Body = HttpService:JSONEncode({action = "DELETE_ALL", shop = tag,
-                    sessionId = sid, playerName = LocalPlayer.Name,
-                    timestamp = os.time()})
-            })
-        end)
-    end
 end
 
 local function cleanText(obj)
@@ -138,8 +79,7 @@ end
 
 -- ═══════════ BLACK MARKET ═══════════
 local BM = {goodFruits = nil, goodAt = 0,
-            goodRestock = {text = "", seconds = 0},
-            lastKey = nil, lastPoll = 0}
+            goodRestock = {text = "", seconds = 0}, lastKey = nil}
 
 local IGNORE_PATTERNS = {
     "_padding", "padding", "uilistlayout", "uigridlayout", "uipadding",
@@ -232,51 +172,13 @@ local function scrapeIfOpen()
     end
 
     local rt, rs = getRestock(ff)
-    return {fruits = result, restock = {text = rt, seconds = rs},
-            counts = {outOfStock = oos, priced = priced, loading = loading}}
-end
-
-local function buildBlackMarket()
-    local fresh, reason = scrapeIfOpen()
-    if fresh then
-        BM.goodFruits  = fresh.fruits
-        BM.goodAt      = os.time()
-        BM.goodRestock = fresh.restock
-    end
-    if not BM.goodFruits then return nil, reason end
-
-    local inStockList, outFruits, totalSeen = {}, {}, 0
-    for key, f in pairs(BM.goodFruits) do
-        totalSeen = totalSeen + 1
-        if f.inStock then
-            table.insert(inStockList, f.name)
-            outFruits[key] = f
-        elseif INCLUDE_OUT_OF_STOCK then
-            outFruits[key] = f
-        end
-    end
-    table.sort(inStockList)
-
-    local key = table.concat(inStockList, "|")
-    local changed = (BM.lastKey ~= nil and BM.lastKey ~= key)
-    BM.lastKey = key
-
-    local age = os.time() - BM.goodAt
-    return {
-        sessionId = Session.bmId, timestamp = os.time(),
-        playerName = LocalPlayer.Name, userId = LocalPlayer.UserId,
-        game = "kinglegacy", shop = "blackmarket",
-        live = (fresh ~= nil), stale = (age > 5), scrapeAge = age,
-        restock = BM.goodRestock,
-        totalFruits = totalSeen, stockCount = #inStockList,
-        inStockList = inStockList, fruits = outFruits,
-        changed = changed
-    }, (fresh and "live" or reason)
+    return {fruits = result, restock = {text = rt, seconds = rs}}
 end
 
 -- ═══════════ MATERIAL DEALER ═══════════
 local MAT = {ok = false, remote = nil, list = nil, data = nil,
-             lastKey = nil, lastTime = nil, timerMode = "unknown", lastPoll = 0}
+             cached = nil, cachedAt = 0, lastKey = nil,
+             lastTime = nil, timerMode = "unknown", lastPoll = 0, lastError = ""}
 
 if ENABLE_MATERIALS then
     local ok = pcall(function()
@@ -303,11 +205,15 @@ local function enrichMaterial(name, qty)
     }
 end
 
-local function buildMaterials()
-    if not MAT.ok then return nil, "materials disabled" end
+-- refresh the cached material block; returns rotated flag
+local function refreshMaterials()
+    if not MAT.ok then return false end
     local ok, res = pcall(function() return MAT.remote:InvokeServer("Get") end)
-    if not ok then return nil, "remote error: " .. tostring(res) end
-    if type(res) ~= "table" or type(res.Stocks) ~= "table" then return nil, "bad response" end
+    if not ok or type(res) ~= "table" or type(res.Stocks) ~= "table" then
+        MAT.lastError = ok and "bad response" or tostring(res)
+        return false
+    end
+    MAT.lastError = ""
 
     local t = tonumber(res.CurrentTime) or 0
     if MAT.lastTime then
@@ -328,19 +234,130 @@ local function buildMaterials()
     local rotated = (MAT.lastKey ~= nil and MAT.lastKey ~= key)
     MAT.lastKey = key
 
-    return {
-        sessionId = Session.matId, timestamp = os.time(),
-        playerName = LocalPlayer.Name, userId = LocalPlayer.UserId,
-        game = "kinglegacy", shop = "materialdealer",
+    MAT.cached = {
         live = true,
         currentTime = t, timerMode = MAT.timerMode, timerText = fmtTime(t),
         restockAtUnix = (MAT.timerMode ~= "elapsed") and (os.time() + t) or nil,
         itemCount = #items, itemList = names, items = items,
-        rotated = rotated
-    }, "ok"
+        scrapedAt = os.time()
+    }
+    MAT.cachedAt = os.time()
+    return rotated
 end
 
--- ═══════════ DISCORD NOTIFY ═══════════
+-- ═══════════ MERGED PAYLOAD ═══════════
+local function buildPayload()
+    -- fruits
+    local fresh, reason = scrapeIfOpen()
+    if fresh then
+        BM.goodFruits  = fresh.fruits
+        BM.goodAt      = os.time()
+        BM.goodRestock = fresh.restock
+    end
+
+    local inStockList, outFruits, totalSeen = {}, {}, 0
+    if BM.goodFruits then
+        for key, f in pairs(BM.goodFruits) do
+            totalSeen = totalSeen + 1
+            if f.inStock then
+                table.insert(inStockList, f.name)
+                outFruits[key] = f
+            elseif INCLUDE_OUT_OF_STOCK then
+                outFruits[key] = f
+            end
+        end
+        table.sort(inStockList)
+    end
+
+    local fruitKey = table.concat(inStockList, "|")
+    local fruitsChanged = (BM.goodFruits ~= nil and BM.lastKey ~= nil and BM.lastKey ~= fruitKey)
+    if BM.goodFruits then BM.lastKey = fruitKey end
+
+    local age = BM.goodFruits and (os.time() - BM.goodAt) or -1
+
+    -- materials block (cached, may be nil if never fetched)
+    local mat = MAT.cached and {
+        live          = (os.time() - MAT.cachedAt) <= (MAT_REFRESH * 3),
+        scrapeAge     = os.time() - MAT.cachedAt,
+        currentTime   = MAT.cached.currentTime,
+        timerMode     = MAT.cached.timerMode,
+        timerText     = MAT.cached.timerText,
+        restockAtUnix = MAT.cached.restockAtUnix,
+        itemCount     = MAT.cached.itemCount,
+        itemList      = MAT.cached.itemList,
+        items         = MAT.cached.items
+    } or {live = false, itemCount = 0, itemList = {}, items = {},
+          error = (MAT.lastError ~= "" and MAT.lastError or "no data yet")}
+
+    return {
+        -- identity
+        sessionId  = Session.id,
+        timestamp  = os.time(),
+        playerName = LocalPlayer.Name,
+        userId     = LocalPlayer.UserId,
+        game       = "kinglegacy",
+        shop       = "blackmarket",       -- kept for existing frontend
+        shops      = {"blackmarket", "materialdealer"},
+
+        -- BLACK MARKET (top level, unchanged shape)
+        live        = (fresh ~= nil),
+        stale       = (age < 0 or age > 5),
+        scrapeAge   = age,
+        restock     = BM.goodRestock,
+        totalFruits = totalSeen,
+        stockCount  = #inStockList,
+        inStockList = inStockList,
+        fruits      = outFruits,
+        changed     = fruitsChanged,
+
+        -- MATERIAL DEALER (nested)
+        materials   = mat
+    }, (fresh and "live" or reason)
+end
+
+local function sendPayload(data)
+    return (pcall(function()
+        Session.posts = Session.posts + 1
+        data.updateNumber = Session.posts
+        request({
+            Url = API_ENDPOINT .. "?session=" .. Session.id .. "&t=" .. os.time(),
+            Method = "POST",
+            Headers = {["Content-Type"] = "application/json",
+                ["Authorization"]       = API_KEY,
+                ["Cache-Control"]       = "no-cache, no-store, must-revalidate",
+                ["X-Session-ID"]        = Session.id,
+                ["X-Update-Number"]     = tostring(Session.posts)},
+            Body = HttpService:JSONEncode(data)
+        })
+    end))
+end
+
+local function sendHeartbeat(bmLive, matLive)
+    pcall(function()
+        request({
+            Url = API_ENDPOINT .. "/heartbeat", Method = "POST",
+            Headers = {["Authorization"] = API_KEY, ["X-Session-ID"] = Session.id},
+            Body = HttpService:JSONEncode({sessionId = Session.id,
+                status = "ALIVE", blackmarket = bmLive, materialdealer = matLive,
+                timestamp = os.time(), uptime = os.time() - Session.startedAt})
+        })
+    end)
+end
+
+local function autoDeleteOnCrash()
+    pcall(function()
+        request({
+            Url = DELETE_ENDPOINT, Method = "POST",
+            Headers = {["Content-Type"] = "application/json",
+                ["Authorization"] = API_KEY, ["X-Session-ID"] = Session.id},
+            Body = HttpService:JSONEncode({action = "DELETE_ALL",
+                sessionId = Session.id, playerName = LocalPlayer.Name,
+                timestamp = os.time()})
+        })
+    end)
+end
+
+-- ═══════════ NOTIFY ═══════════
 local function notifyFruits(d)
     local body = (#d.inStockList > 0)
         and ("**" .. table.concat(d.inStockList, "**\n**") .. "**")
@@ -349,16 +366,17 @@ local function notifyFruits(d)
         body .. "\n\n" .. (d.restock.text ~= "" and d.restock.text or "no timer"), 16753920)
 end
 
-local function notifyMaterials(d)
+local function notifyMaterials()
+    if not MAT.cached then return end
     local lines = {}
-    for _, it in ipairs(d.items) do
+    for _, it in ipairs(MAT.cached.items) do
         local cost = (it.priceType == "Gem")
             and (it.priceValue .. " 💎") or ("$" .. comma(it.priceValue))
         table.insert(lines, string.format("**%s** — %s | x%d | %s",
             it.name, it.tier, it.stock, cost))
     end
     discord("⚒️ Material Dealer — New Stock",
-        table.concat(lines, "\n") .. "\n\nResets in " .. d.timerText, 3447003)
+        table.concat(lines, "\n") .. "\n\nResets in " .. MAT.cached.timerText, 3447003)
 end
 
 -- ═══════════ MAIN ═══════════
@@ -375,92 +393,81 @@ LocalPlayer.AncestryChanged:Connect(function()
     if not LocalPlayer.Parent then autoDeleteOnCrash() end
 end)
 
+if MAT.ok then refreshMaterials() end
+
 print("═══════════════════════════════════════")
-print("  Black Market : " .. (ENABLE_BLACKMARKET and "ON — OPEN THE UI" or "off"))
-print("  Materials    : " .. (ENABLE_MATERIALS and (MAT.ok and "ON — no UI needed" or "FAILED") or "off"))
+print("  ONE record, both shops merged")
+print("  Fruits    -> top level (open the UI)")
+print("  Materials -> payload.materials")
 print("  POST -> " .. API_ENDPOINT)
-print("  BM  session: " .. Session.bmId)
-print("  MAT session: " .. Session.matId)
+print("  Session: " .. Session.id)
 print("═══════════════════════════════════════")
 
 Session.lastHeartbeat = os.time()
 Session.lastStatus = os.time()
 
-local lastBMReason, bmLive, matLive = "", false, false
+local lastReason = ""
 
 while true do
     local now = os.time()
 
-    -- ── BLACK MARKET ──
-    if ENABLE_BLACKMARKET and (now - BM.lastPoll) >= BM_INTERVAL then
-        BM.lastPoll = now
-        local ok, data, reason = pcall(buildBlackMarket)
+    -- refresh materials on its own slower cadence
+    if MAT.ok and (now - MAT.lastPoll) >= MAT_REFRESH then
+        MAT.lastPoll = now
+        local ok, rotated = pcall(refreshMaterials)
+        if ok and rotated and DISCORD_ON_CHANGE then
+            print("🔄 MAT ROTATION")
+            notifyMaterials()
+        end
+    end
+
+    -- build + post merged payload
+    if (now - Session.lastPost) >= POST_INTERVAL then
+        Session.lastPost = now
+        local ok, data, reason = pcall(buildPayload)
+
         if ok and data then
-            bmLive = data.live
-            print(string.format("%s BM %d/%d [%s] | %s",
-                data.live and "🟢" or ("🟡" .. data.scrapeAge .. "s"),
+            local m = data.materials
+            print(string.format("%s BM %d/%d [%s] | MAT %s %d [%s]",
+                data.live and "🟢" or (data.scrapeAge < 0 and "⚪" or "🟡"),
                 data.stockCount, data.totalFruits,
                 table.concat(data.inStockList, ", "),
-                data.restock.text ~= "" and data.restock.text or "no timer"))
-            if post("blackmarket", Session.bmId, data) then
-                print("   ✅ BM post #" .. Session.posts)
+                m.live and "🟢" or "🔴", m.itemCount or 0,
+                table.concat(m.itemList or {}, ", ")))
+
+            if sendPayload(data) then
+                print("   ✅ POST #" .. Session.posts)
             else
-                print("   ❌ BM post failed")
+                print("   ❌ POST failed")
             end
+
             if data.changed and DISCORD_ON_CHANGE then
                 print("   🔄 BM STOCK CHANGED")
                 notifyFruits(data)
             end
-        else
-            bmLive = false
-            local r = tostring(reason or data)
-            if r ~= lastBMReason then
-                print("⏸️ BM: " .. r .. " — open the Black Market UI")
-                lastBMReason = r
-            end
-        end
-    end
 
-    -- ── MATERIAL DEALER ──
-    if ENABLE_MATERIALS and MAT.ok and (now - MAT.lastPoll) >= MAT_INTERVAL then
-        MAT.lastPoll = now
-        local ok, data, reason = pcall(buildMaterials)
-        if ok and data then
-            matLive = true
-            print(string.format("🟢 MAT %d items [%s] | %s (%s)",
-                data.itemCount, table.concat(data.itemList, ", "),
-                data.timerText, data.timerMode))
-            if post("materialdealer", Session.matId, data) then
-                print("   ✅ MAT post #" .. Session.posts)
-            else
-                print("   ❌ MAT post failed")
+            if not data.live and reason ~= lastReason then
+                print("   ⏸️ fruits: " .. tostring(reason))
+                lastReason = reason
             end
-            if data.rotated and DISCORD_ON_CHANGE then
-                print("   🔄 MAT ROTATION")
-                notifyMaterials(data)
+
+            if (now - Session.lastHeartbeat) >= HEARTBEAT_INTERVAL then
+                sendHeartbeat(data.live, m.live)
+                Session.lastHeartbeat = now
+            end
+
+            if STATUS_INTERVAL > 0 and (now - Session.lastStatus) >= STATUS_INTERVAL then
+                discord("👑 King Legacy Monitor — Alive",
+                    string.format("Posts: **%d**\nFruits: %s (%d in stock)\nMaterials: %s (%d)\nUptime: %s",
+                        Session.posts,
+                        data.live and "🟢 live" or "🔴 UI closed", data.stockCount,
+                        m.live and "🟢 live" or "🔴 down", m.itemCount or 0,
+                        fmtTime(now - Session.startedAt)), 65280)
+                Session.lastStatus = now
             end
         else
-            matLive = false
-            print("⏸️ MAT: " .. tostring(reason or data))
+            print("❌ build error: " .. tostring(data))
         end
-    end
-
-    -- ── HEARTBEAT / STATUS ──
-    if (now - Session.lastHeartbeat) >= HEARTBEAT_INTERVAL then
-        if ENABLE_BLACKMARKET then heartbeat("blackmarket", Session.bmId, bmLive) end
-        if ENABLE_MATERIALS and MAT.ok then heartbeat("materialdealer", Session.matId, matLive) end
-        Session.lastHeartbeat = now
-    end
-
-    if STATUS_INTERVAL > 0 and (now - Session.lastStatus) >= STATUS_INTERVAL then
-        discord("👑 King Legacy Monitor — Alive",
-            string.format("Posts: **%d**\nBlack Market: %s\nMaterials: %s\nUptime: %s",
-                Session.posts,
-                bmLive and "🟢 live" or "🔴 UI closed",
-                matLive and "🟢 live" or "🔴 error",
-                fmtTime(now - Session.startedAt)),
-            65280)
-        Session.lastStatus = now
     end
 
     wait(0.5)

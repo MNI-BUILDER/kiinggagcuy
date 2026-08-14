@@ -14,9 +14,9 @@ local CHECK_INTERVAL  = 1
 local HEARTBEAT_INTERVAL = 10
 local DISCORD_UPDATE_INTERVAL = 300
 
--- false = send ONLY the fruits currently in stock (what you want for a stock site)
--- true  = send all 43 with inStock flags
-local INCLUDE_OUT_OF_STOCK = false
+-- true  = send all 43 fruits with inStock flags (default)
+-- false = send ONLY the fruits currently in stock
+local INCLUDE_OUT_OF_STOCK = true
 
 local HttpService = game:GetService("HttpService")
 local LocalPlayer = game.Players.LocalPlayer
